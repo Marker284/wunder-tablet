@@ -51,7 +51,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-VERSION = "2.5"
+VERSION = "2.6"
 
 MDM_PACKAGE = "com.hmdm.launcher"
 MDM_HOME_ACTIVITY = "com.hmdm.launcher/.MainActivity"
@@ -676,6 +676,11 @@ class App:
     @property
     def label(self) -> str:
         return self.name or self.package
+
+    @property
+    def title(self) -> str:
+        """Для логов: пакет виден всегда, описание — если оно есть."""
+        return f"{self.package} · {self.name}" if self.name else self.package
 
 
 _PKG_ACT_RE = re.compile(r"([a-zA-Z][\w.]*[\w])/([\w.$]+)")
