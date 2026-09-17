@@ -35,7 +35,7 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import launcher_cleanup as core
 
-TUI_VERSION = "1.7"
+TUI_VERSION = "1.8"
 
 STAGES = [
     ("launchers", "Лаунчеры — снести заводские, оставить MDM"),
@@ -44,6 +44,7 @@ STAGES = [
     ("pcmode", "Режим ПК — десктопные оболочки и переключатели"),
     ("thirdparty", "Сторонние — игры и всё, что поставили дети"),
     ("extras", "Прочее — Google Meet, Google Chat"),
+    ("mac", "MAC-адрес — запись и отключение рандомизации"),
     ("accounts", "Аккаунты — аудит учёток и профилей"),
 ]
 
@@ -104,6 +105,7 @@ class Options:
         self.restart_mdm = False
         self.adb = os.environ.get("ADB", "")
         self.adb_path = ""          # заполняется при старте поиском core.find_adb
+        self.fix_mac = True
         self.mute_notifications = True
         self.mute_stores = True
         self.remove_preinstalled = False
@@ -138,6 +140,7 @@ class Options:
             apk=self.apk, install_mdm=self.install_mdm, mdm_perms=self.mdm_perms,
             remove_extra_users=self.remove_extra_users,
             allowed_file=self.allowed_file,
+            fix_mac=self.fix_mac,
             mute_notifications=self.mute_notifications,
             mute_stores=self.mute_stores,
             remove_preinstalled=self.remove_preinstalled,
@@ -734,6 +737,11 @@ class Runner:
               CLR_WARN if summary.restrictions else 0, bold=False)
         field("Google-аккаунт", ", ".join(google) or "НЕТ",
               CLR_OK if google else CLR_ERR)
+        mac = summary.specs.get("Wi-Fi MAC", "")
+        randomization = summary.specs.get("рандомизация MAC", "")
+        if mac or randomization:
+            field("Wi-Fi MAC", f"{mac or '—'} · {randomization or 'неизвестно'}",
+                  CLR_OK if randomization == "выключена" else CLR_WARN, bold=False)
         field("Домашний экран", summary.home_now,
               CLR_OK if summary.home_now == core.MDM_PACKAGE else CLR_WARN)
         field("Браузер", summary.browser_now,

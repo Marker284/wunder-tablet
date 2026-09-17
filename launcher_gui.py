@@ -226,6 +226,8 @@ def card_html(summary: core.Summary | None) -> str:
         row("Кто держит owner", summary.owner_label or "никто", OK if owner_ok else ERR),
         row("Ограничения owner", ", ".join(summary.restrictions) or "нет",
             WARN if summary.restrictions else FG),
+        row("Wi-Fi MAC", f"{summary.specs.get('Wi-Fi MAC','—')} · "
+            f"{summary.specs.get('рандомизация MAC','неизвестно')}"),
         row("Google-аккаунт",
             "<br>".join(acc.name for acc in google) if google else "НЕТ",
             FG if google else ERR),
@@ -388,6 +390,7 @@ class MainWindow(QMainWindow):
             ("pcmode", "Режим ПК — десктопные оболочки и переключатели"),
             ("thirdparty", "Сторонние — игры и всё, что поставили дети"),
             ("extras", "Прочее — Google Meet, Google Chat"),
+            ("mac", "MAC-адрес — запись и отключение рандомизации"),
             ("accounts", "Аккаунты — аудит учёток и профилей"),
         ):
             box = QCheckBox(label)
@@ -426,6 +429,7 @@ class MainWindow(QMainWindow):
             ("mute_notifications", "Глушить уведомления неразрешённых приложений", True),
             ("mute_stores", "Глушить уведомления магазинов (Play, GetApps)", True),
             ("remove_preinstalled", "Сносить заводские приложения вендора", False),
+            ("fix_mac", "Отключать рандомизацию MAC-адреса", True),
             ("remove_extra_users", "Удалять лишние профили ради device owner", False),
             ("auto", "Авторежим — не спрашивать подтверждений", False),
             ("force_unknown", "Сносить и неопознанные пакеты", False),
@@ -493,7 +497,7 @@ class MainWindow(QMainWindow):
 
     def build_args(self, list_only: bool, dry_run: bool) -> argparse.Namespace:
         stages = [key for key, box in self.stage_boxes.items() if box.isChecked()]
-        only = "all" if len(stages) == 7 else (stages[0] if len(stages) == 1 else "all")
+        only = "all" if len(stages) == 8 else (stages[0] if len(stages) == 1 else "all")
         mode = ["auto", "uninstall", "disable"][self.mode_combo.currentIndex()]
         keep = [part.strip() for part in self.keep_edit.text().split(",") if part.strip()]
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")

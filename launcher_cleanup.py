@@ -51,7 +51,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-VERSION = "2.6"
+VERSION = "2.7"
 
 MDM_PACKAGE = "com.hmdm.launcher"
 MDM_HOME_ACTIVITY = "com.hmdm.launcher/.MainActivity"
@@ -1173,7 +1173,8 @@ def ensure_device_owner(adb: Adb, log: Log, args: argparse.Namespace,
 INVENTORY_COLUMNS = [
     "дата", "серийный", "ADB-ID", "бренд", "модель", "Android", "API", "прошивка",
     "патч безопасности", "ОЗУ", "накопитель", "свободно", "экран", "плотность",
-    "платформа", "Wi-Fi MAC", "Android ID", "батарея", "Google-аккаунт", "владелец",
+    "платформа", "Wi-Fi MAC", "Wi-Fi MAC заводской", "рандомизация MAC",
+    "Bluetooth MAC", "Android ID", "батарея", "Google-аккаунт", "владелец",
     "домашний экран", "браузер", "удалено", "отключено", "не удалось",
     "ФИО ученика", "класс", "примечание",
 ]
@@ -1216,8 +1217,7 @@ def collect_specs(adb: Adb, log: Log) -> dict[str, str]:
     match = re.search(r"Physical density:\s*(\S+)", density)
     specs["плотность"] = match.group(1) if match else ""
 
-    mac = adb.shell("cat /sys/class/net/wlan0/address").strip()
-    specs["Wi-Fi MAC"] = mac if re.fullmatch(r"[0-9a-f:]{17}", mac) else ""
+    specs.update(collect_mac(adb))
     specs["Android ID"] = adb.shell("settings get secure android_id").strip()
 
     battery = adb.shell("dumpsys battery")
@@ -1231,6 +1231,8 @@ def collect_specs(adb: Adb, log: Log) -> dict[str, str]:
     log.ok(f"{specs['бренд']} {specs['модель']} · ОЗУ {specs['ОЗУ']} · "
            f"накопитель {specs['накопитель']} (свободно {specs['свободно']}) · "
            f"батарея {specs['батарея']}")
+    log.ok(f"MAC {specs['Wi-Fi MAC'] or '—'} · рандомизация: "
+           f"{specs['рандомизация MAC'] or 'неизвестно'}")
     return specs
 
 
@@ -1401,6 +1403,122 @@ def resolve_mdm_home(adb: Adb, log: Log) -> str:
             log.info(f"HOME-активность MDM на этом устройстве: {component}")
         return component
     return MDM_HOME_ACTIVITY
+
+
+# Проперти, где вендоры держат заводской MAC.
+FACTORY_MAC_PROPS = (
+    "ro.boot.wifimacaddr", "ro.boot.mac", "ro.wifi.macaddr",
+    "persist.vendor.wifi.macaddr", "vendor.wifi.macaddr", "ro.vendor.wifi.macaddr",
+)
+
+# Настройки рандомизации. Применяются только те, что есть в прошивке.
+MAC_SETTINGS = [
+    ("global", "wifi_connected_mac_randomization_enabled", "0"),
+    ("global", "wifi_non_persistent_mac_randomization_enabled", "0"),
+    ("global", "wifi_aggressive_randomization_enabled", "0"),
+]
+
+
+def is_randomized_mac(mac: str) -> bool:
+    """У случайного MAC во втором бите первого октета стоит единица."""
+    try:
+        return bool(int(mac.split(":")[0], 16) & 0b10)
+    except (ValueError, IndexError):
+        return False
+
+
+def collect_mac(adb: Adb) -> dict[str, str]:
+    """Текущий и заводской MAC, признак рандомизации, MAC Bluetooth."""
+    info = {"Wi-Fi MAC": "", "Wi-Fi MAC заводской": "",
+            "рандомизация MAC": "", "Bluetooth MAC": ""}
+
+    # /sys/class/net/*/address на Android 11+ закрыт для adb shell —
+    # рабочий источник это dumpsys wifi, он же показывает useRandomizedMac.
+    for interface in ("wlan0", "wlan1", "eth0"):
+        mac = adb.shell(f"cat /sys/class/net/{interface}/address").strip().lower()
+        if re.fullmatch(r"[0-9a-f:]{17}", mac):
+            info["Wi-Fi MAC"] = mac
+            break
+
+    wifi_dump = ""
+    if not info["Wi-Fi MAC"]:
+        wifi_dump = adb.shell("dumpsys wifi | grep -m4 -E 'mWifiInfo|useRandomizedMac'")
+        for candidate in re.findall(r"MAC:\s*([0-9a-fA-F:]{17})", wifi_dump):
+            candidate = candidate.lower()
+            if candidate != "02:00:00:00:00:00":     # заглушка отключённого интерфейса
+                info["Wi-Fi MAC"] = candidate
+                break
+
+    for prop in FACTORY_MAC_PROPS:
+        value = adb.prop(prop).strip().lower()
+        if re.fullmatch(r"[0-9a-f:]{17}", value):
+            info["Wi-Fi MAC заводской"] = value
+            break
+
+    bluetooth = adb.shell("settings get secure bluetooth_address").strip().lower()
+    if re.fullmatch(r"[0-9a-f:]{17}", bluetooth):
+        info["Bluetooth MAC"] = bluetooth
+
+    current = info["Wi-Fi MAC"]
+    factory = info["Wi-Fi MAC заводской"]
+    if "useRandomizedMac=true" in wifi_dump:
+        info["рандомизация MAC"] = "включена (useRandomizedMac=true)"
+    elif current:
+        if is_randomized_mac(current):
+            info["рандомизация MAC"] = "включена (MAC случайный)"
+        elif factory and current != factory:
+            info["рандомизация MAC"] = "включена (MAC отличается от заводского)"
+        else:
+            info["рандомизация MAC"] = "выключена"
+    return info
+
+
+def disable_mac_randomization(adb: Adb, log: Log, dry_run: bool) -> bool:
+    """Гасит рандомизацию MAC настолько, насколько это доступно adb."""
+    log.step("Рандомизация MAC-адреса")
+
+    before = collect_mac(adb)
+    log.info(f"текущий MAC: {before['Wi-Fi MAC'] or '—'}"
+             + (f" · заводской: {before['Wi-Fi MAC заводской']}"
+                if before["Wi-Fi MAC заводской"] else ""))
+
+    applied = apply_settings(adb, log, MAC_SETTINGS, dry_run)
+
+    # На части прошивок есть отдельная команда — ищем её в справке, а не гадаем.
+    help_text = adb.shell("cmd wifi -h") + adb.shell("cmd wifi help")
+    match = re.search(r"(set-[\w-]*mac-randomization[\w-]*)", help_text)
+    if match:
+        command = f"cmd wifi {match.group(1)} disabled"
+        if dry_run:
+            log.cmd(f"[dry-run] adb shell {command}")
+        else:
+            log.cmd(f"adb shell {command}")
+            out = adb.shell(command).strip()
+            if out and ("Exception" in out or "Usage" in out):
+                log.warn(f"{match.group(1)}: {short_error(out)}")
+            else:
+                applied += 1
+    else:
+        log.info("отдельной команды cmd wifi для рандомизации в этой прошивке нет")
+
+    if dry_run:
+        return True
+
+    after = collect_mac(adb)
+    state = after["рандомизация MAC"]
+    if state == "выключена":
+        log.ok(f"рандомизация выключена, MAC {after['Wi-Fi MAC']}")
+        return True
+
+    log.warn(f"рандомизация всё ещё {state or 'неизвестно'} — "
+             f"MAC {after['Wi-Fi MAC'] or '—'}")
+    log.info("настройка живёт у каждой сети Wi-Fi отдельно: на планшете "
+             "Настройки → Wi-Fi → сеть → «Тип MAC-адреса» → «MAC устройства»")
+    log.info("на весь парк это ставится только со стороны MDM: device owner "
+             "задаёт сети macRandomizationSetting=RANDOMIZATION_NONE")
+    log.info("открыть настройки Wi-Fi на планшете: "
+             "adb shell am start -a android.settings.WIFI_SETTINGS")
+    return False
 
 
 def load_allowed_file(path: str, log: Log) -> dict[str, str]:
@@ -1819,6 +1937,7 @@ class Summary:
     thirdparty_removed: list[str] = field(default_factory=list)
     thirdparty_disabled: list[str] = field(default_factory=list)
     muted: int = 0
+    mac_fixed: bool = False
     settings_applied: int = 0
     failed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
@@ -1917,6 +2036,7 @@ def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
     do_desktop = args.only in ("all", "pcmode")
     do_thirdparty = args.only in ("all", "thirdparty")
     do_extras = args.only in ("all", "extras")
+    do_mac = args.only in ("all", "mac") and args.fix_mac
     do_accounts = args.only in ("all", "accounts")
 
     log.step("Проверка MDM-агента")
@@ -2123,11 +2243,15 @@ def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
         summary.failed += failed
         summary.skipped += skipped
 
-    # ── 7. Аккаунты ──
+    # ── 7. MAC-адрес ──
+    if do_mac and not args.list_only:
+        summary.mac_fixed = disable_mac_randomization(adb, log, args.dry_run)
+
+    # ── 8. Аккаунты ──
     if do_accounts:
         summary.accounts, summary.users = audit_accounts(adb, log, args)
 
-    # ── 8. Контрольное закрепление домашнего экрана ──
+    # ── 9. Контрольное закрепление домашнего экрана ──
     if do_launchers and not args.list_only and not args.no_set_home and mdm_present:
         log.step("Контроль домашнего экрана")
         summary.home_set = set_mdm_home(
@@ -2158,7 +2282,7 @@ def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
         if args.student or args.student_class:
             summary.student = args.student
             summary.student_class = args.student_class
-        elif args.ask_student and not args.auto_student_skip:
+        elif args.ask_student and not args.auto and not args.auto_student_skip:
             summary.student, summary.student_class = ask_student(log, summary)
         row["ФИО ученика"] = summary.student
         row["класс"] = summary.student_class
@@ -2272,6 +2396,12 @@ def print_device_card(log: Log, item: Summary) -> None:
     if other:
         row("Прочие аккаунты", ", ".join(f"{acc.name} [{acc.type_label}]" for acc in other))
 
+    mac = item.specs.get("Wi-Fi MAC", "")
+    randomization = item.specs.get("рандомизация MAC", "")
+    if mac or randomization:
+        row("Wi-Fi MAC", mac or "—")
+        row("Рандомизация MAC", randomization or "неизвестно",
+            C.GREEN if randomization == "выключена" else C.YELLOW)
     row("Домашний экран", item.home_now,
         C.GREEN if item.home_now == MDM_PACKAGE else C.YELLOW)
     row("Браузер", item.browser_now,
@@ -2363,7 +2493,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="обработать все подключённые устройства")
     parser.add_argument("--only",
                         choices=["all", "launchers", "browsers", "assistants", "pcmode",
-                                 "thirdparty", "extras", "accounts"],
+                                 "thirdparty", "extras", "mac", "accounts"],
                         default="all", help="выполнить только один этап (по умолчанию all)")
     parser.add_argument("-y", "--auto", action="store_true",
                         help="авторежим: без подтверждений (незнакомые пакеты всё равно пропускаются)")
@@ -2391,6 +2521,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-mute-notifications", dest="mute_notifications",
                         action="store_false",
                         help="не глушить уведомления у неразрешённых приложений")
+    parser.add_argument("--no-fix-mac", dest="fix_mac", action="store_false",
+                        help="не трогать рандомизацию MAC-адреса")
     parser.add_argument("--remove-preinstalled", action="store_true",
                         help="сносить и заводские приложения вендора "
                              "(калькулятор, погода, заметки и т.п.)")
@@ -2420,7 +2552,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-inventory", dest="inventory", action="store_const", const="",
                         help="не вести таблицу учёта")
     parser.add_argument("--no-ask-student", dest="ask_student", action="store_false",
-                        help="не спрашивать ФИО и класс ученика")
+                        help="не спрашивать ФИО и класс ученика "
+                             "(в --auto вопрос не задаётся в любом случае)")
     parser.add_argument("--student", default="", metavar="ФИО",
                         help="ФИО ученика без вопроса (для пакетного режима)")
     parser.add_argument("--class", dest="student_class", default="", metavar="КЛАСС",
