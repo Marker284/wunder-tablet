@@ -110,6 +110,7 @@ class Bridge(QObject):
     ask = Signal(str, bool)              # вопрос, значение по умолчанию
     done = Signal(object)                # core.Summary | None
     progress = Signal(str)
+    stores = Signal(object)              # list[core.StoreInfo]
 
 
 class GuiLog(core.Log):
@@ -199,6 +200,48 @@ class Worker(QThread):
             log.close()
 
 
+class StoresWorker(QThread):
+    """Отдельный поток для вкладки «Магазины»: сканирование и вкл/выкл."""
+
+    def __init__(self, serial: str, adb_binary: str, action: str,
+                 packages: list[str], bridge: Bridge, deep: bool = True):
+        super().__init__()
+        self.serial = serial
+        self.adb_binary = adb_binary
+        self.action = action                  # scan | disable | enable | remove
+        self.packages = packages
+        self.bridge = bridge
+        self.deep = deep
+
+    def run(self) -> None:
+        log = GuiLog(self.bridge)
+        adb = core.Adb(binary=self.adb_binary, serial=self.serial, log=log, verbose=True)
+        try:
+            if self.action != "scan":
+                titles = {"disable": "Отключение магазинов",
+                          "enable": "Включение магазинов",
+                          "remove": "Снос магазинов"}[self.action]
+                log.step(titles)
+                for package in self.packages:
+                    if self.action == "enable":
+                        core.enable_app(adb, log, package, dry_run=False)
+                        continue
+                    app = core.App(package=package, name=core.APP_STORES.get(package, ""),
+                                   kind="store", is_system=True, is_known=True)
+                    core.remove_app(adb, log, app,
+                                    "uninstall" if self.action == "remove" else "disable",
+                                    dry_run=False)
+            log.step("Сканирование магазинов приложений")
+            stores = core.collect_stores(adb, log, deep=self.deep)
+            log.ok(f"найдено магазинов: {len(stores)}")
+            self.bridge.stores.emit(stores)
+        except Exception as exc:                      # noqa: BLE001 — показать оператору
+            log.err(f"сбой: {exc}")
+            self.bridge.stores.emit([])
+        finally:
+            log.close()
+
+
 # ─────────────────────── карточка устройства ───────────────────────
 
 
@@ -244,6 +287,28 @@ def card_html(summary: core.Summary | None) -> str:
     rows.append(row("Браузер", summary.browser_now,
                     OK if summary.browser_now == core.DEFAULT_BROWSER else WARN))
 
+    stores_value = core.stores_card_value(summary)
+    if stores_value:
+        working = [st for st in summary.stores if st.state == "installed"]
+        rows.append(row("Магазины", stores_value, WARN if working else OK))
+    if summary.locale_before or summary.locale_now:
+        if summary.locale_ok:
+            locale_value, locale_color = summary.locale_now or summary.locale_before, OK
+        elif summary.locale_state == "reboot":
+            locale_value = f"{summary.locale_now} — после перезагрузки"
+            locale_color = WARN
+        elif summary.locale_state == "failed":
+            locale_value = f"{summary.locale_before or '?'} — сменить не удалось"
+            locale_color = ERR
+        else:
+            locale_value, locale_color = summary.locale_now or summary.locale_before, WARN
+        rows.append(row("Язык системы", locale_value, locale_color))
+    if summary.time_note:
+        rows.append(row("Время", summary.time_note, OK if summary.time_auto else ERR))
+    if summary.settings_applied:
+        rows.append(row("Настройки",
+                        f"заблокировано ограничений: {summary.settings_applied}", OK))
+
     plates = ""
     if not summary.owner_component:
         plates += plate_html("ВЛАДЕЛЕЦ УСТРОЙСТВА НЕ НАЗНАЧЕН",
@@ -274,6 +339,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Wunder Tablet · подготовка планшетов — GUI {GUI_VERSION}")
         self.resize(1280, 820)
         self.worker: Worker | None = None
+        self.stores_worker: StoresWorker | None = None
         self.summary: core.Summary | None = None
         self.settings = load_settings()
 
@@ -290,6 +356,7 @@ class MainWindow(QMainWindow):
         self.bridge.ask.connect(self.on_ask)
         self.bridge.done.connect(self.on_done)
         self.bridge.progress.connect(lambda text: self.status.setText(text))
+        self.bridge.stores.connect(self.on_stores)
 
         self.refresh_devices()
 
@@ -335,6 +402,7 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_run_tab(), "Прогон")
+        tabs.addTab(self._build_stores_tab(), "Магазины")
         tabs.addTab(self._build_settings_tab(), "Настройки")
         layout.addWidget(tabs, 1)
         return panel
@@ -375,6 +443,140 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_view, 1)
         return page
 
+    def _build_stores_tab(self) -> QWidget:
+        """Что за магазины стоят на планшете и что с ними сделать."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        hint = QLabel("Магазины — это второй способ поставить игру мимо MDM. "
+                      "Отметьте лишние и выключите: выключается любой магазин, "
+                      "включая Google Play, пакет остаётся на месте и "
+                      "возвращается кнопкой «Включить обратно». Столбец "
+                      "состояния показывает, выключен он сейчас или нет.")
+        hint.setObjectName("sub")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        self.btn_stores_scan = QPushButton("Показать магазины")
+        self.btn_stores_scan.clicked.connect(lambda: self.run_stores("scan"))
+        self.btn_stores_off = QPushButton("Выключить отмеченные")
+        self.btn_stores_off.setObjectName("primary")
+        self.btn_stores_off.clicked.connect(lambda: self.run_stores("disable"))
+        self.btn_stores_on = QPushButton("Включить обратно")
+        self.btn_stores_on.clicked.connect(lambda: self.run_stores("enable"))
+        self.btn_stores_rm = QPushButton("Снести совсем")
+        self.btn_stores_rm.setObjectName("danger")
+        self.btn_stores_rm.clicked.connect(lambda: self.run_stores("remove"))
+        for widget in (self.btn_stores_scan, self.btn_stores_off,
+                       self.btn_stores_on, self.btn_stores_rm):
+            buttons.addWidget(widget)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.stores_list = QListWidget()
+        self.stores_list.setSelectionMode(QListWidget.NoSelection)
+        layout.addWidget(self.stores_list, 1)
+
+        self.stores_status = QLabel("нажмите «Показать магазины»")
+        self.stores_status.setObjectName("sub")
+        layout.addWidget(self.stores_status)
+        return page
+
+    def run_stores(self, action: str) -> None:
+        serial = self.selected_serial()
+        if not serial:
+            QMessageBox.warning(self, "Нет планшета", "Сначала выберите устройство в списке.")
+            return
+        if self.stores_worker and self.stores_worker.isRunning():
+            return
+
+        packages: list[str] = []
+        if action != "scan":
+            packages = self.checked_stores()
+            if not packages:
+                QMessageBox.information(self, "Ничего не отмечено",
+                                        "Отметьте галочками магазины в списке.")
+                return
+            verb = {"disable": "Выключить", "enable": "Включить обратно",
+                    "remove": "Снести совсем"}[action]
+            answer = QMessageBox.question(
+                self, "Подтверждение",
+                f"{verb} на {serial}:\n\n" + "\n".join(packages))
+            if answer != QMessageBox.Yes:
+                return
+
+            # Снос необратим, поэтому защищённые пакеты (Google Play) требуют
+            # отдельного согласия — так же, как ключ --include-play в CLI.
+            if action == "remove":
+                protected = [pkg for pkg in packages if core.is_protected(pkg, set())]
+                if protected:
+                    second = QMessageBox.warning(
+                        self, "Снос Google Play необратим",
+                        "Вы собираетесь НАВСЕГДА удалить:\n\n"
+                        + "\n".join(protected)
+                        + "\n\nЭто ломает обновления GMS и WebView и вернётся "
+                          "только сбросом планшета к заводским настройкам.\n"
+                          "Чтобы просто закрыть магазин, пользуйтесь кнопкой "
+                          "«Выключить отмеченные» — она обратима.\n\n"
+                          "Всё равно удалить?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if second != QMessageBox.Yes:
+                        return
+
+        deep = not self.flag_boxes["stores_catalog_only"].isChecked()
+        self.set_stores_busy(True)
+        self.stores_status.setText("работаю…")
+        self.stores_worker = StoresWorker(serial, self.adb_path(), action,
+                                          packages, self.bridge, deep)
+        self.stores_worker.start()
+
+    def checked_stores(self) -> list[str]:
+        packages = []
+        for index in range(self.stores_list.count()):
+            item = self.stores_list.item(index)
+            if item.checkState() == Qt.Checked and item.data(Qt.UserRole):
+                packages.append(item.data(Qt.UserRole))
+        return packages
+
+    def on_stores(self, stores: object) -> None:
+        self.set_stores_busy(False)
+        self.stores_list.clear()
+        if not isinstance(stores, list) or not stores:
+            self.stores_status.setText("магазинов не найдено")
+            return
+        working = 0
+        for store in stores:
+            state = store.state_label
+            if store.state == "installed":
+                working += 1
+            flags = []
+            if store.protected:
+                flags.append("Play Store — выключается, но не сносится")
+            if not store.known:
+                flags.append(f"не в справочнике, найден по {store.source}")
+            note = ("  ·  " + "  ·  ".join(flags)) if flags else ""
+            label = (f"{store.label}\n{store.package}  ·  {state}"
+                     f"  ·  версия {store.version or '?'}"
+                     f"  ·  уведомления {store.notifications}{note}")
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, store.package)
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Unchecked)
+            if store.state == "disabled":
+                item.setForeground(Qt.gray)
+            elif store.protected:
+                item.setForeground(Qt.cyan)
+            self.stores_list.addItem(item)
+        self.stores_status.setText(
+            f"всего {len(stores)} · работают {working} · "
+            f"отключены {len(stores) - working}")
+
+    def set_stores_busy(self, busy: bool) -> None:
+        for button in (self.btn_stores_scan, self.btn_stores_off,
+                       self.btn_stores_on, self.btn_stores_rm):
+            button.setEnabled(not busy)
+
     def _build_settings_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -389,8 +591,10 @@ class MainWindow(QMainWindow):
             ("assistants", "Ассистенты — Google Assistant, Bixby, ZUI AI…"),
             ("pcmode", "Режим ПК — десктопные оболочки и переключатели"),
             ("thirdparty", "Сторонние — игры и всё, что поставили дети"),
+            ("stores", "Магазины — выключить все, включая Google Play"),
             ("extras", "Прочее — Google Meet, Google Chat"),
             ("mac", "MAC-адрес — запись и отключение рандомизации"),
+            ("system", "Система — русский язык и автоматическое время"),
             ("accounts", "Аккаунты — аудит учёток и профилей"),
         ):
             box = QCheckBox(label)
@@ -410,6 +614,9 @@ class MainWindow(QMainWindow):
 
         self.browser_edit = QLineEdit(saved.get("browser", core.DEFAULT_BROWSER))
         form.addRow("Оставить браузер", self.browser_edit)
+
+        self.locale_edit = QLineEdit(saved.get("locale", core.SYSTEM_LOCALE))
+        form.addRow("Язык системы", self.locale_edit)
 
         self.keep_edit = QLineEdit(saved.get("keep", ""))
         self.keep_edit.setPlaceholderText("пакеты через запятую — никогда не трогать")
@@ -435,6 +642,17 @@ class MainWindow(QMainWindow):
             ("force_unknown", "Сносить и неопознанные пакеты", False),
             ("with_freeform", "Заодно снести плавающую панель ZUI", False),
             ("lock_accounts", "Запретить гостя, новых пользователей и смену аккаунтов", False),
+            ("lock_settings", "Заблокировать настройки, кроме Wi-Fi и Bluetooth", False),
+            ("block_stores", "Сносить/отключать сторонние магазины приложений", False),
+            ("disable_stores", "Этап «Магазины»: отключать найденные магазины", True),
+            ("keep_stores", "Этап «Магазины»: только показать, ничего не выключать", False),
+            ("set_locale", "Ставить русский язык системы, если стоит другой", True),
+            ("auto_time", "Включать автоматические дату, время и часовой пояс", True),
+            ("enable_stores", "Этап «Магазины»: включать магазины обратно", False),
+            ("remove_stores", "Этап «Магазины»: сносить магазины совсем", False),
+            ("keep_play", "НЕ выключать Google Play (по умолчанию выключается)", False),
+            ("include_play", "Разрешить СНОСИТЬ Google Play (необратимо)", False),
+            ("stores_catalog_only", "Магазины искать только по справочнику (быстрее)", False),
             ("no_set_home", "НЕ закреплять MDM как домашний экран", False),
             ("no_set_owner", "НЕ назначать MDM владельцем устройства", False),
             ("restart_mdm", "Перезапустить MDM в конце", False),
@@ -497,7 +715,8 @@ class MainWindow(QMainWindow):
 
     def build_args(self, list_only: bool, dry_run: bool) -> argparse.Namespace:
         stages = [key for key, box in self.stage_boxes.items() if box.isChecked()]
-        only = "all" if len(stages) == 8 else (stages[0] if len(stages) == 1 else "all")
+        only = ("all" if len(stages) == len(self.stage_boxes)
+                else (stages[0] if len(stages) == 1 else "all"))
         mode = ["auto", "uninstall", "disable"][self.mode_combo.currentIndex()]
         keep = [part.strip() for part in self.keep_edit.text().split(",") if part.strip()]
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -512,6 +731,8 @@ class MainWindow(QMainWindow):
             allowed_file=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "allowed_apps.txt"),
             inventory="", ask_student=False, auto_student_skip=True,
+            list_stores=False,
+            locale=self.locale_edit.text().strip() or core.SYSTEM_LOCALE,
             student="", student_class="", on_duplicate="update",
             log_path=os.path.join(log_dir, f"gui_{stamp}.log"),
             **{key: box.isChecked() for key, box in self.flag_boxes.items()},
@@ -550,9 +771,12 @@ class MainWindow(QMainWindow):
         self.append_line("banner", f"\n═══ {mode_label}: {serial} ═══")
 
         # Этапы гоняем по очереди: движок принимает ровно один --only за проход.
-        self.queue = list(stages) if len(stages) < 6 else ["all"]
+        # «all» — только когда отмечены действительно все этапы: при жёстком
+        # пороге снятые галочки молча возвращались в прогон.
+        self.queue = ["all"] if len(stages) == len(self.stage_boxes) else list(stages)
         self.queue_args = args
         self.queue_serial = serial
+        self.summary = None
         self.run_next()
 
     def run_next(self) -> None:
@@ -590,8 +814,9 @@ class MainWindow(QMainWindow):
 
     def on_done(self, summary: object) -> None:
         if isinstance(summary, core.Summary):
-            self.summary = summary
-            self.card.setHtml(card_html(summary))
+            # этапы идут по очереди — в карточке должен собраться весь прогон
+            self.summary = core.merge_summaries(self.summary, summary)
+            self.card.setHtml(card_html(self.summary))
         self.run_next()
 
     # ── настройки ──
@@ -602,6 +827,7 @@ class MainWindow(QMainWindow):
             "flags": {key: box.isChecked() for key, box in self.flag_boxes.items()},
             "mode_index": self.mode_combo.currentIndex(),
             "browser": self.browser_edit.text().strip(),
+            "locale": self.locale_edit.text().strip(),
             "keep": self.keep_edit.text().strip(),
             "adb": self.adb_edit.text().strip(),
         }

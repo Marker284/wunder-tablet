@@ -35,7 +35,7 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import launcher_cleanup as core
 
-TUI_VERSION = "1.8"
+TUI_VERSION = "1.9"
 
 STAGES = [
     ("launchers", "Лаунчеры — снести заводские, оставить MDM"),
@@ -43,8 +43,10 @@ STAGES = [
     ("assistants", "Ассистенты — Google Assistant, Bixby, ZUI AI…"),
     ("pcmode", "Режим ПК — десктопные оболочки и переключатели"),
     ("thirdparty", "Сторонние — игры и всё, что поставили дети"),
+    ("stores", "Магазины — выключить все, включая Google Play"),
     ("extras", "Прочее — Google Meet, Google Chat"),
     ("mac", "MAC-адрес — запись и отключение рандомизации"),
+    ("system", "Система — русский язык и автоматическое время"),
     ("accounts", "Аккаунты — аудит учёток и профилей"),
 ]
 
@@ -102,6 +104,18 @@ class Options:
         self.force_unknown = False
         self.with_freeform = False
         self.lock_accounts = False
+        self.lock_settings = False
+        self.block_stores = False
+        self.disable_stores = False    # этап stores: отключать найденные магазины
+        self.enable_stores = False     # вернуть отключённые магазины обратно
+        self.remove_stores = False
+        self.include_play = False      # разрешить СНОСИТЬ Google Play
+        self.keep_play = False         # не выключать Google Play
+        self.stores_catalog_only = False
+        self.keep_stores = False       # только показать магазины, не выключать
+        self.set_locale = True         # переводить систему на русский
+        self.locale = core.SYSTEM_LOCALE
+        self.auto_time = True          # автоматические дата, время, часовой пояс
         self.restart_mdm = False
         self.adb = os.environ.get("ADB", "")
         self.adb_path = ""          # заполняется при старте поиском core.find_adb
@@ -135,6 +149,14 @@ class Options:
             browser=self.browser, keep=[], list_only=False, dry_run=self.dry_run,
             auto=self.auto, force_unknown=self.force_unknown,
             with_freeform=self.with_freeform, lock_accounts=self.lock_accounts,
+            lock_settings=self.lock_settings, block_stores=self.block_stores,
+            list_stores=False, disable_stores=self.disable_stores,
+            enable_stores=self.enable_stores, remove_stores=self.remove_stores,
+            include_play=self.include_play, keep_play=self.keep_play,
+            stores_catalog_only=self.stores_catalog_only,
+            keep_stores=self.keep_stores,
+            set_locale=self.set_locale, locale=self.locale,
+            auto_time=self.auto_time,
             no_set_home=False, no_set_owner=False, restart_mdm=self.restart_mdm,
             ignore_missing_mdm=False, log_path=log_path,
             apk=self.apk, install_mdm=self.install_mdm, mdm_perms=self.mdm_perms,
@@ -263,6 +285,18 @@ def build_wizard_rows(options: Options) -> list[tuple[str, str, str, str]]:
     rows.append(("Глушить уведомления магазинов",
                  "да" if options.mute_stores else "нет",
                  "Play, GetApps", "mutestores"))
+    rows.append(("Сносить/отключать сторонние магазины",
+                 "да" if options.block_stores else "нет",
+                 "GetApps, Galaxy Store, AppGallery — Play Store не трогаем", "blockstores"))
+    rows.append(("Выключать магазины приложений",
+                 "нет" if options.keep_stores else "да",
+                 "этап «Магазины»: pm disable-user, возвращается обратно",
+                 "keepstores"))
+    rows.append(("Включить магазины обратно", "да" if options.enable_stores else "нет",
+                 "отмена отключения", "enablestores"))
+    rows.append(("Выключать и Google Play", "нет" if options.keep_play else "да",
+                 "pm disable-user обратим; «нет» — оставить Play работать",
+                 "keepplay"))
     rows.append(("Сносить заводские приложения вендора",
                  "да" if options.remove_preinstalled else "нет",
                  "калькулятор, погода, заметки", "preinst"))
@@ -282,6 +316,13 @@ def build_wizard_rows(options: Options) -> list[tuple[str, str, str, str]]:
                  "com.zui.freeform.sidebar", "freeform"))
     rows.append(("Запретить гостя и смену аккаунтов", "да" if options.lock_accounts else "нет",
                  "", "lock"))
+    rows.append(("Ставить русский язык системы", "да" if options.set_locale else "нет",
+                 f"если сейчас другой — переключить на {options.locale}", "locale"))
+    rows.append(("Включать автоматические дату и время", "да" if options.auto_time else "нет",
+                 "auto_time и auto_time_zone — синхронизация по сети", "autotime"))
+    rows.append(("Заблокировать настройки (кроме Wi-Fi/Bluetooth)",
+                 "да" if options.lock_settings else "нет",
+                 "VPN, сертификаты, сброс, установка приложений", "locksettings"))
     rows.append(("Перезапускать MDM в конце", "да" if options.restart_mdm else "нет",
                  "", "restart"))
     return rows
@@ -301,6 +342,24 @@ def toggle_row(options: Options, kind: str, forward: bool = True) -> None:
         options.with_freeform = not options.with_freeform
     elif kind == "lock":
         options.lock_accounts = not options.lock_accounts
+    elif kind == "locksettings":
+        options.lock_settings = not options.lock_settings
+    elif kind == "blockstores":
+        options.block_stores = not options.block_stores
+    elif kind == "keepstores":
+        options.keep_stores = not options.keep_stores
+        if options.keep_stores:
+            options.enable_stores = False
+    elif kind == "locale":
+        options.set_locale = not options.set_locale
+    elif kind == "autotime":
+        options.auto_time = not options.auto_time
+    elif kind == "enablestores":
+        options.enable_stores = not options.enable_stores
+        if options.enable_stores:
+            options.keep_stores = False
+    elif kind == "keepplay":
+        options.keep_play = not options.keep_play
     elif kind == "restart":
         options.restart_mdm = not options.restart_mdm
     elif kind == "install":
@@ -618,7 +677,8 @@ class Runner:
                 worker.join()
                 log.close()
                 if self._stage_result is not None:
-                    result = self._stage_result
+                    # этапы идут по очереди, паспорт должен собрать их все
+                    result = core.merge_summaries(result, self._stage_result)
         finally:
             core.confirm = original
         return result
@@ -746,6 +806,10 @@ class Runner:
               CLR_OK if summary.home_now == core.MDM_PACKAGE else CLR_WARN)
         field("Браузер", summary.browser_now,
               CLR_OK if summary.browser_now == core.DEFAULT_BROWSER else CLR_WARN)
+        if summary.stores:
+            live = [s for s in summary.stores if s.state == "installed"]
+            field("Магазины", core.stores_card_value(summary)[:box_width - 28],
+                  CLR_WARN if live else CLR_OK, bold=False)
 
         rule()
         pair_by_color = {core.C.GREEN: CLR_OK, core.C.YELLOW: CLR_WARN,

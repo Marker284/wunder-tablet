@@ -15,9 +15,13 @@ launcher_cleanup.py — подготовка планшетов: лаунчер�
   4. РЕЖИМ ПК  — сносит десктопные оболочки (Lenovo PC Mode / ZuiLauncherPC,
                  Motorola Ready For, Samsung DeX, Huawei Desktop) и гасит
                  системные переключатели вроде zui_pc_mode.
-  5. ПРОЧЕЕ    — сносит лишние приложения из списка KNOWN_EXTRA_APPS
+  5. МАГАЗИНЫ  — находит все магазины приложений (справочник + опрос
+                 market://) и выключает их, включая Google Play.
+  6. ПРОЧЕЕ    — сносит лишние приложения из списка KNOWN_EXTRA_APPS
                  (Google Meet / Duo, Google Chat).
-  6. АККАУНТЫ  — выводит все учётные записи (Google, Samsung, Mi и т.д.)
+  7. СИСТЕМА   — русский язык интерфейса и автоматические дата, время
+                 и часовой пояс; по ключу — блокировка настроек.
+  8. АККАУНТЫ  — выводит все учётные записи (Google, Samsung, Mi и т.д.)
                  и список пользователей устройства. Только отчёт;
                  удаление аккаунта через ADB невозможно — нужен сброс.
 
@@ -36,6 +40,9 @@ launcher_cleanup.py — подготовка планшетов: лаунчер�
   ./launcher_cleanup.py --auto --all-devices   # пачкой по всем подключённым
   ./launcher_cleanup.py -n -s R52T1023         # прогон вхолостую на одном
   ./launcher_cleanup.py --only accounts        # только аудит учёток
+  ./launcher_cleanup.py --list-stores          # какие магазины стоят на планшете
+  ./launcher_cleanup.py --only stores          # выключить все магазины и Play
+  ./launcher_cleanup.py --only system          # только русский язык и автовремя
 """
 
 from __future__ import annotations
@@ -49,9 +56,9 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
-VERSION = "2.7"
+VERSION = "2.8"
 
 MDM_PACKAGE = "com.hmdm.launcher"
 MDM_HOME_ACTIVITY = "com.hmdm.launcher/.MainActivity"
@@ -319,13 +326,70 @@ ALLOWED_PREFIXES = (
 # Приложение, установленное этими установщиками, считается согласованным.
 TRUSTED_INSTALLERS = {MDM_PACKAGE}
 
-# Магазины: уведомления «обнови игру» — тоже способ увести ребёнка из урока.
+# Магазины — второй способ поставить игру мимо MDM, поэтому этап «stores»
+# выключает их ВСЕ, включая Google Play. Выключение — это pm disable-user:
+# пакет остаётся на месте и возвращается ключом --enable-stores.
+#
+# Google Play при этом остаётся в PROTECTED: он защищён от СНОСА (необратимо и
+# ломает обновления GMS/WebView), но не от отключения. Снести его можно только
+# явным ключом --include-play. Побочный эффект выключенного Play: школьные
+# приложения из allowed_apps.txt перестанут обновляться сами — обновления идут
+# из консоли Headwind MDM. Нужен работающий Play — ключ --keep-play.
 APP_STORES = {
     "com.android.vending": "Google Play",
     "com.xiaomi.mipicks": "GetApps (Xiaomi)",
     "com.xiaomi.discover": "Рекомендации Xiaomi",
+    "com.xiaomi.market": "Mi Market (старый GetApps)",
     "com.sec.android.app.samsungapps": "Galaxy Store",
     "com.huawei.appmarket": "AppGallery",
+    "com.hihonor.appmarket": "Honor AppGallery",
+    "com.amazon.venezia": "Amazon Appstore",
+    "com.aurora.store": "Aurora Store",
+    "org.fdroid.fdroid": "F-Droid",
+    "com.aptoide.pt": "Aptoide",
+    "com.apkpure.aegon": "APKPure",
+    "com.heytap.market": "HeyTap Market (Oppo/Realme)",
+    "com.oppo.market": "OPPO Store",
+    "com.bbk.appstore": "vivo Store",
+}
+
+# ─── ограничения настроек: блокируем всё, кроме Wi-Fi и Bluetooth ───
+# Bluetooth сюда намеренно НЕ входит — детям нужно самим подключать
+# клавиатуру/стилус, поэтому DISALLOW_CONFIG_BLUETOOTH не выставляется.
+# Wi-Fi (DISALLOW_CONFIG_WIFI) тоже не трогаем — просили оставить подключение.
+# Не входят и DISALLOW_UNINSTALL_APPS / DISALLOW_APPS_CONTROL / ограничения на
+# аккаунты — они ломают собственное управление пакетами через adb (см.
+# предупреждение про no_uninstall_apps выше) или живут отдельно в
+# --lock-accounts. no_install_apps ставится через dpm/adb install не глушится
+# — Headwind MDM продолжит ставить и обновлять приложения из своей консоли.
+SETTINGS_LOCKDOWN_RESTRICTIONS = [
+    "no_install_apps",                     # установка приложений (в т.ч. из Play)
+    "no_install_unknown_sources",          # сайдлоад из файлового менеджера/браузера
+    "no_install_unknown_sources_globally",
+    "no_config_credentials",               # сертификаты
+    "no_config_vpn",                       # VPN
+    "no_config_tethering",                 # раздача интернета
+    "no_config_private_dns",               # приватный DNS
+    "no_config_mobile_networks",           # мобильные сети / APN
+    "no_config_cell_broadcasts",           # экстренные оповещения
+    "no_config_date_time",                 # дата и время
+    "no_config_locale",                    # язык системы
+    "no_network_reset",                    # сброс настроек сети
+    "no_factory_reset",                    # сброс к заводским
+    "no_safe_boot",                        # безопасный режим (обход MDM)
+]
+
+# ─── язык системы и время ───
+# Планшеты приезжают с завода на английском или китайском, а время — руками
+# выставленное на витрине магазина. Оба параметра приводим к школьному виду:
+# русский интерфейс и синхронизация времени по сети.
+SYSTEM_LOCALE = "ru-RU"
+
+# Автоматические дата, время и часовой пояс. Пишутся в global через adb —
+# у shell есть WRITE_SECURE_SETTINGS, поэтому работает без device owner.
+TIME_SETTINGS = {
+    "auto_time": "1",        # синхронизация времени по сети
+    "auto_time_zone": "1",   # часовой пояс по сети оператора/Wi-Fi
 }
 
 # HOME-пакеты — системные заглушки, их удаление ломает загрузку.
@@ -1175,7 +1239,8 @@ INVENTORY_COLUMNS = [
     "патч безопасности", "ОЗУ", "накопитель", "свободно", "экран", "плотность",
     "платформа", "Wi-Fi MAC", "Wi-Fi MAC заводской", "рандомизация MAC",
     "Bluetooth MAC", "Android ID", "батарея", "Google-аккаунт", "владелец",
-    "домашний экран", "браузер", "удалено", "отключено", "не удалось",
+    "домашний экран", "браузер", "язык", "время", "магазины",
+    "удалено", "отключено", "не удалось",
     "ФИО ученика", "класс", "примечание",
 ]
 
@@ -1252,6 +1317,10 @@ def inventory_row(summary: Summary, specs: dict[str, str]) -> dict[str, str]:
     row["владелец"] = summary.owner_label or "не назначен"
     row["домашний экран"] = summary.home_now
     row["браузер"] = summary.browser_now
+    row["язык"] = summary.locale_now or summary.locale_before
+    row["время"] = summary.time_note if summary.time_auto else (
+        f"НЕ АВТО: {summary.time_note}" if summary.time_note else "")
+    row["магазины"] = stores_card_value(summary)
     row["удалено"] = ", ".join(removed)
     row["отключено"] = ", ".join(disabled)
     row["не удалось"] = ", ".join(summary.failed)
@@ -1595,6 +1664,569 @@ def collect_thirdparty(adb: Adb, log: Log, args: argparse.Namespace) -> list[App
     return apps
 
 
+# ─────────────────────── магазины приложений ───────────────────────
+#
+# Этап «stores» отвечает на два вопроса оператора:
+#   1) какие магазины вообще стоят на этом планшете;
+#   2) какие из них сейчас работают, а какие уже отключены.
+# По умолчанию этап ничего не меняет — это обзор. Действия включаются
+# ключами --disable-stores / --enable-stores / --remove-stores.
+
+# Схемы, которыми магазин заявляет себя системе. Если пакет умеет открывать
+# market://details?id=… — это магазин, даже если его нет в APP_STORES: так
+# находятся вендорские магазины, о которых мы заранее не знали.
+STORE_INTENT_URIS = (
+    "market://details?id=com.example",
+    "appmarket://details?id=com.example",
+    "mimarket://details?id=com.example",
+    "samsungapps://ProductDetail/com.example",
+    "amzn://apps/android?p=com.example",
+)
+
+# Пакеты, которые откликаются на market://, но магазинами не являются:
+# GMS перехватывает ссылки Play, MDM сам ставит приложения.
+STORE_NON_TARGETS = {
+    "com.google.android.gms",
+    "com.google.android.gsf",
+    "com.android.htmlviewer",
+    "com.android.chrome",
+    MDM_PACKAGE,
+}
+
+
+@dataclass
+class StoreInfo:
+    """Один магазин на устройстве — ровно то, что видит оператор в таблице."""
+
+    package: str
+    name: str = ""
+    state: str = "installed"        # installed | disabled | absent
+    is_system: bool = True
+    version: str = ""
+    notifications: str = "?"        # разрешены | заглушены | ?
+    known: bool = True              # есть в справочнике APP_STORES
+    protected: bool = False         # в PROTECTED: Play Store без --include-play
+    source: str = "каталог"         # каталог | market:// и т.п.
+
+    @property
+    def label(self) -> str:
+        return self.name or self.package
+
+    @property
+    def title(self) -> str:
+        return f"{self.package} · {self.name}" if self.name else self.package
+
+    @property
+    def state_label(self) -> str:
+        return {"installed": "работает", "disabled": "отключён",
+                "absent": "удалён"}.get(self.state, self.state)
+
+
+def detect_store_packages(adb: Adb, log: Log) -> dict[str, str]:
+    """Пакеты, откликающиеся на market:// и родственные схемы."""
+    found: dict[str, str] = {}
+    for uri in STORE_INTENT_URIS:
+        scheme = uri.split(":", 1)[0] + "://"
+        for package in _query_activities(
+            adb, log, f'-a android.intent.action.VIEW -d "{uri}"'
+        ):
+            if package in STORE_NON_TARGETS or "." not in package:
+                continue
+            found.setdefault(package, scheme)
+    return found
+
+
+def package_version(adb: Adb, package: str) -> str:
+    match = re.search(r"versionName=(\S+)", adb.shell(f"dumpsys package {package}"))
+    return match.group(1) if match else ""
+
+
+def notifications_state(adb: Adb, package: str) -> str:
+    """разрешены | заглушены | ? — видно ли магазину напоминать о себе."""
+    out = adb.shell(f"cmd appops get {package} POST_NOTIFICATION")
+    out += adb.shell(f"cmd appops get --uid {package} POST_NOTIFICATION")
+    if "ignore" in out or "deny" in out:
+        return "заглушены"
+    if "allow" in out or "default" in out:
+        return "разрешены"
+    return "?"
+
+
+def collect_stores(adb: Adb, log: Log, deep: bool = True) -> list[StoreInfo]:
+    """Все магазины, которые есть на устройстве, с их текущим состоянием."""
+    sources: dict[str, str] = {package: "каталог" for package in APP_STORES}
+    if deep:
+        for package, scheme in detect_store_packages(adb, log).items():
+            sources.setdefault(package, scheme)
+
+    present = installed_packages(adb, "--user 0")
+    disabled = installed_packages(adb, "-d --user 0")
+    system_pkgs = installed_packages(adb, "-s")
+
+    stores: list[StoreInfo] = []
+    for package in sorted(sources):
+        if package not in present:
+            continue
+        stores.append(StoreInfo(
+            package=package,
+            name=APP_STORES.get(package, ""),
+            state="disabled" if package in disabled else "installed",
+            is_system=package in system_pkgs,
+            version=package_version(adb, package),
+            notifications=notifications_state(adb, package),
+            known=package in APP_STORES,
+            protected=is_protected(package, set()),
+            source=sources[package],
+        ))
+    return stores
+
+
+def print_stores(log: Log, stores: list[StoreInfo]) -> None:
+    if not stores:
+        log.ok("магазинов приложений на устройстве не найдено")
+        return
+    rows: list[list[str]] = []
+    for store in stores:
+        if store.state == "disabled":
+            action = C.p(C.GREEN, "уже выключен")
+        elif store.protected:
+            action = C.p(C.RED, "выключить (снос — только с --include-play)")
+        elif store.known:
+            action = C.p(C.RED, "выключить")
+        else:
+            action = C.p(C.YELLOW, "выключить (не в справочнике)")
+        state_color = C.GREEN if store.state == "disabled" else C.YELLOW
+        rows.append([
+            store.package,
+            store.name or "—",
+            "системный" if store.is_system else "польз.",
+            store.version or "—",
+            C.p(state_color, store.state_label),
+            store.notifications,
+            action,
+        ])
+    log.table(["ПАКЕТ", "НАЗВАНИЕ", "ТИП", "ВЕРСИЯ", "СОСТОЯНИЕ", "УВЕДОМЛЕНИЯ",
+               "ДЕЙСТВИЕ"], rows)
+    log.raw(C.p(C.DIM, "  выключаются все магазины, включая Google Play: "
+                       "pm disable-user обратим (--enable-stores возвращает обратно)"))
+    log.raw(C.p(C.DIM, "  оставить Play работающим — ключ --keep-play"))
+
+
+def enable_app(adb: Adb, log: Log, package: str, dry_run: bool) -> bool:
+    """Возвращает магазин в рабочее состояние: enable + unsuspend + unhide."""
+    commands = [f"pm enable --user 0 {package}",
+                f"pm unsuspend --user 0 {package}",
+                f"pm unhide --user 0 {package}"]
+    if dry_run:
+        for command in commands:
+            log.cmd(f"[dry-run] adb shell {command}")
+        log.ok(f"{package} — будет включён обратно")
+        return True
+
+    for command in commands:
+        log.cmd(f"adb shell {command}")
+        adb.shell(command)
+
+    if pkg_state(adb, package) == "installed":
+        log.ok(f"{package} — включён")
+        return True
+    log.warn(f"{package} — включить не удалось, состояние: {pkg_state(adb, package)}")
+    return False
+
+
+def select_store_targets(log: Log, stores: list[StoreInfo], action: str,
+                         args: argparse.Namespace) -> list[StoreInfo]:
+    """Отбирает магазины под действие и вслух объясняет каждый пропуск.
+
+    Выключение (disable-user) обратимо, поэтому под него попадают ВСЕ
+    магазины, включая Google Play и незнакомые, найденные по market://.
+    Строгость остаётся только у сноса: он необратим, и там Play требует
+    --include-play, а незнакомый пакет — --force-unknown.
+    """
+    include_play = getattr(args, "include_play", False)
+    keep_play = getattr(args, "keep_play", False)
+    keep = set(args.keep)
+    reversible = action in ("disable", "enable")
+    targets: list[StoreInfo] = []
+    for store in stores:
+        if store.package in keep:
+            log.info(f"{store.title} — в белом списке --keep, не трогаю")
+        elif store.protected and keep_play:
+            log.info(f"{store.title} — оставлен по ключу --keep-play")
+        elif store.protected and not reversible and not include_play:
+            log.warn(f"{store.title} — сносить Play Store не даю: это ломает "
+                     f"обновления GMS/WebView и возвращается только сбросом. "
+                     f"Выключить обратимо — --disable-stores, снести силой — "
+                     f"--include-play")
+        elif not store.known and not reversible and not args.force_unknown:
+            log.warn(f"{store.title} — найден по {store.source}, но не в справочнике: "
+                     f"сносить не даю (ключ --force-unknown снимает ограничение)")
+        elif action == "disable" and store.state == "disabled":
+            log.ok(f"{store.title} — уже отключён")
+        elif action == "enable" and store.state == "installed":
+            log.ok(f"{store.title} — уже работает")
+        else:
+            targets.append(store)
+    return targets
+
+
+def stores_stage(adb: Adb, log: Log, args: argparse.Namespace,
+                 summary: "Summary") -> None:
+    """Этап «магазины»: показать, что стоит, и при необходимости отключить."""
+    log.step("Магазины приложений")
+    stores = collect_stores(adb, log, deep=not getattr(args, "stores_catalog_only", False))
+    summary.stores = stores
+    working = [store for store in stores if store.state == "installed"]
+    log.info(f"найдено магазинов: {len(stores)} "
+             f"(работают {len(working)}, отключены {len(stores) - len(working)})")
+    log.raw()
+    print_stores(log, stores)
+
+    if getattr(args, "enable_stores", False):
+        action = "enable"
+    elif getattr(args, "remove_stores", False):
+        action = "remove"
+    elif getattr(args, "keep_stores", False):
+        log.raw()
+        log.info("это только обзор — ничего не меняю (ключ --keep-stores)")
+        log.info("отключить: --disable-stores · снести: --remove-stores · "
+                 "вернуть обратно: --enable-stores")
+        return
+    else:
+        # По умолчанию магазины выключаются: ребёнку они не нужны, а выключение
+        # обратимо ключом --enable-stores. Оставить всё как есть — --keep-stores.
+        action = "disable"
+
+    if args.list_only:
+        log.raw()
+        log.info("режим --list: изменений не вношу")
+        return
+
+    log.raw()
+    targets = select_store_targets(log, stores, action, args)
+    if not targets:
+        log.ok("магазины уже в нужном состоянии — делать нечего")
+        return
+
+    titles = ", ".join(store.label for store in targets)
+    question = {"disable": f"Отключить магазины ({len(targets)} шт.): {titles}?",
+                "enable": f"Включить магазины обратно ({len(targets)} шт.): {titles}?",
+                "remove": f"Снести магазины ({len(targets)} шт.): {titles}?"}[action]
+    if not confirm(question, default=action == "enable", auto=args.auto):
+        log.warn("пропущено по решению оператора")
+        summary.skipped += [store.package for store in targets]
+        return
+
+    before = {store.package: store.state for store in stores}
+    for store in targets:
+        if action == "enable":
+            if enable_app(adb, log, store.package, args.dry_run):
+                summary.stores_enabled.append(store.package)
+            continue
+
+        app = App(package=store.package, name=store.name, kind="store",
+                  is_system=store.is_system, is_known=True)
+        # «отключить» — это именно disable-user: пакет остаётся на месте и
+        # возвращается ключом --enable-stores, в отличие от сноса.
+        mode = args.mode if action == "remove" else "disable"
+        status = remove_app(adb, log, app, mode, args.dry_run)
+        if status == "removed":
+            summary.stores_removed.append(store.package)
+        elif status == "disabled":
+            summary.stores_disabled.append(store.package)
+
+    # Состояние перечитываем с планшета, а не верим тексту команд: только так
+    # видно, что Play Store действительно выключен, а не «отчитался Success».
+    refresh_store_states(adb, stores, args.dry_run, action, targets)
+    summary.stores_failed = [
+        store.package for store in targets
+        if not store_action_done(store, action)
+    ]
+    for package in summary.stores_failed:
+        if package not in summary.failed:
+            summary.failed.append(package)
+    log.raw()
+    print_store_results(log, stores, before, action, args.dry_run,
+                        {store.package for store in targets})
+
+
+def refresh_store_states(adb: Adb, stores: list[StoreInfo], dry_run: bool,
+                         action: str, targets: list[StoreInfo]) -> None:
+    """Перечитывает фактическое состояние каждого магазина после действия."""
+    if dry_run:
+        wanted = {"disable": "disabled", "remove": "absent", "enable": "installed"}
+        for store in targets:
+            store.state = wanted.get(action, store.state)
+        return
+    present = installed_packages(adb, "--user 0")
+    disabled = installed_packages(adb, "-d --user 0")
+    for store in stores:
+        if store.package not in present:
+            store.state = "absent"
+        else:
+            store.state = "disabled" if store.package in disabled else "installed"
+
+
+def store_action_done(store: StoreInfo, action: str) -> bool:
+    if action == "enable":
+        return store.state == "installed"
+    if action == "remove":
+        return store.state in ("absent", "disabled")
+    return store.state in ("disabled", "absent")
+
+
+def print_store_results(log: Log, stores: list[StoreInfo], before: dict[str, str],
+                        action: str, dry_run: bool, touched: set[str]) -> None:
+    """Итог по каждому магазину: было → стало и выключен он в итоге или нет."""
+    labels = {"installed": "работает", "disabled": "выключен", "absent": "удалён"}
+    rows: list[list[str]] = []
+    for store in stores:
+        was = labels.get(before.get(store.package, ""), "?")
+        now = labels.get(store.state, store.state)
+        if store.package not in touched and store.state == "installed":
+            verdict = C.p(C.YELLOW, "— оставлен")
+        elif store.state == "absent":
+            verdict = C.p(C.GREEN, "✔ УДАЛЁН")
+        elif store.state == "disabled":
+            verdict = C.p(C.GREEN, "✔ ВЫКЛЮЧЕН")
+        elif action == "enable":
+            verdict = C.p(C.BLUE, "✔ ВКЛЮЧЁН ОБРАТНО")
+        else:
+            verdict = C.p(C.RED, "✖ НЕ ВЫКЛЮЧЕН")
+        rows.append([store.package, store.name or "—", was, now, verdict])
+    log.table(["ПАКЕТ", "НАЗВАНИЕ", "БЫЛО", "СТАЛО", "ИТОГ"], rows)
+
+    off = [store for store in stores if store.state != "installed"]
+    left = [store for store in stores if store.state == "installed"]
+    suffix = " (dry-run: состояние не менялось)" if dry_run else ""
+    log.raw()
+    if action == "enable":
+        log.ok(f"включено обратно {len(left)} из {len(stores)}; "
+               f"выключенными остались {len(off)}{suffix}")
+        return
+    failed = [store for store in left if store.package in touched]
+    if failed:
+        log.err(f"НЕ ВЫКЛЮЧЕНЫ: {', '.join(store.label for store in failed)}{suffix}")
+        log.info("обычная причина — политика device owner или системный пакет "
+                 "вендора: снимите ограничение в консоли Headwind MDM и повторите")
+    verb = "снесено" if action == "remove" else "выключено"
+    if left:
+        log.warn(f"{verb} {len(off)} из {len(stores)}; "
+                 f"работают: {', '.join(store.label for store in left)}{suffix}")
+    else:
+        log.ok(f"магазинов не осталось: {verb} {len(off)} из {len(stores)}{suffix}")
+
+
+def stores_card_value(item: "Summary") -> str:
+    """Строка для паспорта планшета: что стоит и что из этого работает."""
+    if not item.stores:
+        return ""
+    working = [store.label for store in item.stores if store.state == "installed"]
+    off = [store for store in item.stores if store.state != "installed"]
+    # «сняли» — только те, что выключили или удалили мы сами в этом прогоне;
+    # остальные выключенные были такими и до нас.
+    touched = set(item.stores_disabled) | set(item.stores_removed)
+    parts = [f"всего {len(item.stores)}"]
+    if working:
+        shown = ", ".join(working[:3]) + ("…" if len(working) > 3 else "")
+        parts.append(f"работают {len(working)}: {shown}")
+    else:
+        parts.append("все отключены")
+    if touched:
+        parts.append(f"снято сейчас {len(touched)}")
+    was_off = len(off) - len(touched)
+    if was_off > 0:
+        parts.append(f"были выключены {was_off}")
+    return " · ".join(parts)
+
+
+# ───────────────── язык системы, время, блокировка настроек ─────────────────
+#
+# Этап «system» приводит планшет к школьному виду до того, как настройки
+# закрываются на замок: русский интерфейс и время, синхронизируемое по сети.
+# Порядок важен — no_config_locale и no_config_date_time из блокировки
+# запрещают менять ровно то, что мы здесь выставляем.
+
+
+def current_locale(adb: Adb) -> str:
+    """Язык, на котором система работает прямо сейчас: ru-RU, en-US и т.п."""
+    match = re.search(r"\b([a-z]{2})-r([A-Z]{2})\b", adb.shell("am get-config"))
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    for source in (adb.prop("persist.sys.locale"),
+                   adb.shell("settings get system system_locales")):
+        value = (source or "").split(",")[0].strip()
+        if value and value != "null":
+            return value.replace("_", "-")
+    return ""
+
+
+def locale_matches(current: str, wanted: str) -> bool:
+    """ru и ru-RU — один язык, сравниваем по языковому коду, не по строке."""
+    if not current:
+        return False
+    return current.split("-")[0].lower() == wanted.split("-")[0].lower()
+
+
+def set_system_locale(adb: Adb, log: Log, wanted: str,
+                      dry_run: bool) -> tuple[str, str]:
+    """Переводит систему на нужный язык.
+
+    Возвращает (состояние, пояснение), где состояние:
+      ok      — язык уже применился;
+      reboot  — записан, применится после перезагрузки планшета;
+      failed  — не поддаётся через adb, нужен MDM или ручное переключение.
+
+    Без root язык меняется не одной командой: на разных прошивках срабатывает
+    либо system_locales, либо persist.sys.locale, либо широковещательный интент.
+    Поэтому отправляем всё подряд и смотрим на фактический результат, а не на
+    вывод команд.
+    """
+    commands = [
+        f"settings put system system_locales {wanted}",
+        f"setprop persist.sys.locale {wanted}",
+        f"am broadcast -a com.android.intent.action.SET_LOCALE "
+        f"--es com.android.intent.extra.LOCALE {wanted}",
+    ]
+    if dry_run:
+        for command in commands:
+            log.cmd(f"[dry-run] adb shell {command}")
+        return "dry-run", f"будет выставлен язык {wanted}"
+
+    for command in commands:
+        log.cmd(f"adb shell {command}")
+        out = adb.shell(command).strip()
+        if out and ("Exception" in out or "denied" in out.lower()):
+            log.warn(f"{command.split(' ')[0]}: {short_error(out)}")
+
+    now = current_locale(adb)
+    if locale_matches(now, wanted):
+        return "ok", now or wanted
+
+    stored = (adb.prop("persist.sys.locale") or "").replace("_", "-")
+    setting = adb.shell("settings get system system_locales").strip()
+    if locale_matches(stored, wanted) or wanted.lower() in setting.lower():
+        return "reboot", f"записан {wanted}, сейчас ещё {now or 'не определён'}"
+    return "failed", now or "не определён"
+
+
+def apply_auto_time(adb: Adb, log: Log, dry_run: bool) -> tuple[bool, str]:
+    """Включает автоматические дату, время и часовой пояс."""
+    if dry_run:
+        for key, value in TIME_SETTINGS.items():
+            log.cmd(f"[dry-run] adb shell settings put global {key} {value}")
+        return True, "будут включены автодата и автопояс"
+
+    for key, value in TIME_SETTINGS.items():
+        command = f"settings put global {key} {value}"
+        log.cmd(f"adb shell {command}")
+        out = adb.shell(command).strip()
+        if out:
+            log.warn(f"{command} → {short_error(out)}")
+
+    missing = [key for key, value in TIME_SETTINGS.items()
+               if adb.shell(f"settings get global {key}").strip() != value]
+    zone = adb.prop("persist.sys.timezone")
+    now = adb.shell("date '+%Y-%m-%d %H:%M'").strip()
+    details = " · ".join(part for part in (now, zone) if part)
+    if missing:
+        return False, f"не применилось: {', '.join(missing)}"
+    return True, details or "включено"
+
+
+def system_stage(adb: Adb, log: Log, args: argparse.Namespace,
+                 summary: "Summary") -> None:
+    """Этап «система»: язык, время и (по ключу) блокировка настроек."""
+    log.step("Язык системы и время")
+
+    summary.locale_before = current_locale(adb)
+    summary.locale_now = summary.locale_before
+    wanted = args.locale or SYSTEM_LOCALE
+
+    if not args.set_locale:
+        log.info(f"язык системы: {summary.locale_before or 'не определён'} "
+                 f"(смена отключена ключом --no-locale)")
+    elif locale_matches(summary.locale_before, wanted):
+        log.ok(f"язык системы уже русский: {summary.locale_before}")
+        summary.locale_ok = True
+    elif args.list_only:
+        log.warn(f"язык системы: {summary.locale_before or 'не определён'} — "
+                 f"нужен {wanted}, но в режиме --list ничего не меняю")
+    else:
+        log.warn(f"язык системы: {summary.locale_before or 'не определён'} — "
+                 f"переключаю на {wanted}")
+        state, note = set_system_locale(adb, log, wanted, args.dry_run)
+        summary.locale_state = state
+        if state == "ok":
+            summary.locale_ok = True
+            summary.locale_now = note
+            log.ok(f"язык системы: {note}")
+        elif state == "dry-run":
+            summary.locale_now = f"{summary.locale_before or '?'} → {wanted}"
+            log.info(note)
+        elif state == "reboot":
+            summary.locale_now = wanted
+            log.warn(f"{note} — применится после перезагрузки планшета")
+            log.info("перезагрузить сейчас: adb reboot")
+        else:
+            log.err(f"язык сменить не удалось, остался {note}")
+            log.info("прошивка не даёт менять язык через adb: выставьте вручную "
+                     "(adb shell am start -a android.settings.LOCALE_SETTINGS) "
+                     "или политикой в консоли Headwind MDM")
+
+    log.raw()
+    if not args.auto_time:
+        log.info("автоматическое время не трогаю (ключ --no-auto-time)")
+    elif args.list_only:
+        zone = adb.prop("persist.sys.timezone")
+        auto = adb.shell("settings get global auto_time").strip()
+        log.info(f"время: auto_time={auto or '?'}, пояс {zone or '?'} "
+                 f"(режим --list, ничего не меняю)")
+    else:
+        ok, note = apply_auto_time(adb, log, args.dry_run)
+        summary.time_auto = ok
+        summary.time_note = note
+        if ok:
+            log.ok(f"дата и время выставляются автоматически — {note}")
+        else:
+            log.err(f"автоматическое время включить не удалось: {note}")
+
+    if args.lock_settings and not args.list_only:
+        log.raw()
+        log.step("Блокировка настроек (кроме Wi-Fi и Bluetooth)")
+        if args.dry_run or confirm(
+            "Заблокировать настройки устройства, оставив доступными "
+            "только Wi-Fi и Bluetooth?", default=True, auto=args.auto
+        ):
+            summary.settings_applied += apply_settings_lockdown(adb, log, args.dry_run)
+
+
+def apply_settings_lockdown(adb: Adb, log: Log, dry_run: bool) -> int:
+    """Блокирует настройки устройства, оставляя доступными Wi-Fi и Bluetooth."""
+    applied = 0
+    for key in SETTINGS_LOCKDOWN_RESTRICTIONS:
+        cmd = f"dpm set-user-restriction {MDM_ADMIN} {key} 1"
+        if dry_run:
+            log.cmd(f"[dry-run] adb shell {cmd}")
+            applied += 1
+            continue
+        log.cmd(f"adb shell {cmd}")
+        out = adb.shell(cmd).strip()
+        if out and "Success" not in out:
+            log.warn(f"{cmd} → {short_error(out)}")
+        else:
+            applied += 1
+
+    if not dry_run:
+        current = read_user_restrictions(adb)
+        missing = [key for key in SETTINGS_LOCKDOWN_RESTRICTIONS if key not in current]
+        if missing:
+            log.warn(f"не применились: {', '.join(missing)}")
+        else:
+            log.ok("настройки заблокированы — доступны только Wi-Fi и Bluetooth")
+    return applied
+
+
 def mute_notifications(adb: Adb, log: Log, packages: list[str], dry_run: bool) -> int:
     """Глушит уведомления — через них дети и открывают игры."""
     muted = 0
@@ -1936,9 +2568,22 @@ class Summary:
     extras_disabled: list[str] = field(default_factory=list)
     thirdparty_removed: list[str] = field(default_factory=list)
     thirdparty_disabled: list[str] = field(default_factory=list)
+    # магазины приложений: что нашли и что с ними сделали
+    stores: list["StoreInfo"] = field(default_factory=list)
+    stores_disabled: list[str] = field(default_factory=list)
+    stores_enabled: list[str] = field(default_factory=list)
+    stores_removed: list[str] = field(default_factory=list)
+    stores_failed: list[str] = field(default_factory=list)
     muted: int = 0
     mac_fixed: bool = False
     settings_applied: int = 0
+    # язык системы и время
+    locale_before: str = ""
+    locale_now: str = ""
+    locale_ok: bool = False
+    locale_state: str = ""          # ok | reboot | failed | dry-run
+    time_auto: bool = False
+    time_note: str = ""
     failed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     accounts: list[Account] = field(default_factory=list)
@@ -2023,6 +2668,29 @@ def cleanup_group(
     return removed, disabled, failed, skipped
 
 
+def merge_summaries(base: "Summary | None", extra: "Summary | None") -> "Summary | None":
+    """Склеивает результаты поэтапных прогонов в один паспорт.
+
+    TUI и GUI запускают выбранные этапы по очереди, каждый раз получая
+    отдельный Summary. Без склейки в паспорт попадал только последний этап,
+    и всё, что сделали предыдущие, из карточки пропадало.
+    """
+    if base is None:
+        return extra
+    if extra is None:
+        return base
+    for item in fields(base):
+        value = getattr(extra, item.name)
+        if value in ("", 0, False, None) or (isinstance(value, list) and not value):
+            continue                      # этап этого поля не трогал
+        current = getattr(base, item.name)
+        if isinstance(value, list) and isinstance(current, list):
+            setattr(base, item.name, current + [v for v in value if v not in current])
+        else:
+            setattr(base, item.name, value)
+    return base
+
+
 def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
     adb = Adb(binary=args.adb, serial=serial, log=log, verbose=True)
     summary = Summary(serial=serial)
@@ -2035,6 +2703,8 @@ def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
     do_assistants = args.only in ("all", "assistants")
     do_desktop = args.only in ("all", "pcmode")
     do_thirdparty = args.only in ("all", "thirdparty")
+    do_stores = args.only in ("all", "stores")
+    do_system = args.only in ("all", "system")
     do_extras = args.only in ("all", "extras")
     do_mac = args.only in ("all", "mac") and args.fix_mac
     do_accounts = args.only in ("all", "accounts")
@@ -2213,6 +2883,30 @@ def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
         summary.failed += failed
         summary.skipped += skipped
 
+        if args.block_stores and not args.list_only:
+            log.step("Магазины приложений")
+            installed = installed_packages(adb)
+            already = {app.package for app in thirdparty}
+            store_apps = [
+                App(package=pkg, name=name, kind="store",
+                    is_system=True, is_known=True)
+                for pkg, name in APP_STORES.items()
+                if pkg in installed and pkg not in already
+                and not is_protected(pkg, set(args.keep))
+            ]
+            if store_apps:
+                print_apps(log, store_apps, set(), {})
+                s_removed, s_disabled, s_failed, s_skipped = cleanup_group(
+                    adb, log, args, store_apps, keep_third, "Магазины приложений"
+                )
+                summary.thirdparty_removed += s_removed
+                summary.thirdparty_disabled += s_disabled
+                summary.failed += s_failed
+                summary.skipped += s_skipped
+                removed += s_removed
+            else:
+                log.ok("сторонних магазинов не найдено (кроме Google Play — он защищён)")
+
         if not args.list_only and args.mute_notifications:
             log.step("Блокировка уведомлений")
             targets = [app.package for app in thirdparty
@@ -2225,6 +2919,10 @@ def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
                 log.ok(f"уведомления заглушены у {summary.muted} приложений")
             else:
                 log.ok("глушить нечего — всё лишнее снято")
+
+    # ── 5а. Магазины приложений (обзор и отключение) ──
+    if do_stores:
+        stores_stage(adb, log, args, summary)
 
     # ── 6. Лишние приложения ──
     if do_extras:
@@ -2246,6 +2944,12 @@ def process_device(serial: str, args: argparse.Namespace, log: Log) -> Summary:
     # ── 7. MAC-адрес ──
     if do_mac and not args.list_only:
         summary.mac_fixed = disable_mac_randomization(adb, log, args.dry_run)
+
+    # ── 7а. Язык системы, время и блокировка настроек ──
+    # Строго до аккаунтов: блокировка запрещает менять язык и время, поэтому
+    # сначала выставляем нужные значения, а замок вешаем следом.
+    if do_system:
+        system_stage(adb, log, args, summary)
 
     # ── 8. Аккаунты ──
     if do_accounts:
@@ -2344,6 +3048,43 @@ def stage_totals(item: Summary) -> list[tuple[str, str, str]]:
         color = C.GREEN
     lines.append(("Пользователи", users, color))
 
+    if item.stores:
+        working = [store for store in item.stores if store.state == "installed"]
+        done = len(item.stores_disabled) + len(item.stores_removed)
+        if item.stores_enabled:
+            value = f"включено обратно {len(item.stores_enabled)}"
+            color = C.YELLOW
+        elif done:
+            value = f"снято {done} · работают {len(working)}"
+            color = C.GREEN if not working else C.YELLOW
+        else:
+            value = f"найдено {len(item.stores)} · работают {len(working)}"
+            color = C.YELLOW if working else C.GREEN
+        lines.append(("Магазины", value, color))
+        if item.stores_failed:
+            lines.append(("Магазины не сняты", ", ".join(item.stores_failed), C.RED))
+
+    if item.locale_before or item.locale_now:
+        if item.locale_ok:
+            value, color = (item.locale_now or item.locale_before), C.GREEN
+        elif item.locale_state == "reboot":
+            value = f"{item.locale_now} — после перезагрузки"
+            color = C.YELLOW
+        elif item.locale_state == "failed":
+            value = f"{item.locale_before or '?'} — сменить не удалось"
+            color = C.RED
+        else:
+            value, color = (item.locale_now or item.locale_before), C.YELLOW
+        lines.append(("Язык системы", value, color))
+
+    if item.time_note:
+        lines.append(("Время", item.time_note,
+                      C.GREEN if item.time_auto else C.RED))
+
+    if item.settings_applied:
+        lines.append(("Настройки", f"заблокировано ограничений: {item.settings_applied}",
+                      C.GREEN))
+
     if item.muted:
         lines.append(("Уведомления", f"заглушены у {item.muted}", C.GREEN))
     if item.failed:
@@ -2406,6 +3147,10 @@ def print_device_card(log: Log, item: Summary) -> None:
         C.GREEN if item.home_now == MDM_PACKAGE else C.YELLOW)
     row("Браузер", item.browser_now,
         C.GREEN if item.browser_now == DEFAULT_BROWSER else C.YELLOW)
+    stores_value = stores_card_value(item)
+    if stores_value:
+        working = [store for store in item.stores if store.state == "installed"]
+        row("Магазины", stores_value, C.YELLOW if working else C.GREEN)
 
     log.raw(C.p(C.CYAN, "├" + "─" * width + "┤"))
     for label, value, color in stage_totals(item):
@@ -2464,6 +3209,10 @@ def print_summary(log: Log, summaries: list[Summary], args: argparse.Namespace) 
         line("режим ПК отключён: ", C.YELLOW, item.desktop_disabled)
         line("прочее удалено:    ", C.GREEN, item.extras_removed)
         line("прочее отключено:  ", C.YELLOW, item.extras_disabled)
+        if item.stores_disabled or item.stores_removed or item.stores_enabled:
+            line("магазины отключены:", C.YELLOW, item.stores_disabled)
+            line("магазины удалены:  ", C.GREEN, item.stores_removed)
+            line("магазины включены: ", C.BLUE, item.stores_enabled)
         if item.skipped:
             line("пропущено:         ", C.BLUE, item.skipped)
         if item.failed:
@@ -2493,7 +3242,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="обработать все подключённые устройства")
     parser.add_argument("--only",
                         choices=["all", "launchers", "browsers", "assistants", "pcmode",
-                                 "thirdparty", "extras", "mac", "accounts"],
+                                 "thirdparty", "stores", "extras", "mac",
+                                 "system", "accounts"],
                         default="all", help="выполнить только один этап (по умолчанию all)")
     parser.add_argument("-y", "--auto", action="store_true",
                         help="авторежим: без подтверждений (незнакомые пакеты всё равно пропускаются)")
@@ -2526,8 +3276,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--remove-preinstalled", action="store_true",
                         help="сносить и заводские приложения вендора "
                              "(калькулятор, погода, заметки и т.п.)")
+    parser.add_argument("--lock-settings", action="store_true",
+                        help="заблокировать настройки устройства (VPN, сертификаты, "
+                             "сброс, установка приложений и т.п.), оставив доступными "
+                             "только Wi-Fi и Bluetooth — чтобы дети сами подключали "
+                             "клавиатуру/стилус по Bluetooth")
+    parser.add_argument("--block-stores", action="store_true",
+                        help="снести/отключить сторонние магазины приложений (GetApps, "
+                             "Galaxy Store, AppGallery, Aurora Store и т.п.); Google Play "
+                             "не трогаем — его блокирует --lock-settings")
     parser.add_argument("--mute-stores", action="store_true",
                         help="заглушить и уведомления магазинов (Play, GetApps)")
+
+    stores = parser.add_argument_group(
+        "магазины приложений",
+        "этап stores: показать, какие магазины стоят на планшете, и отключить их. "
+        "Без ключей действия этап только показывает таблицу и ничего не меняет.")
+    stores.add_argument("--list-stores", action="store_true",
+                        help="показать магазины и выйти (то же, что --only stores --list)")
+    stores.add_argument("--disable-stores", action="store_true",
+                        help="отключить найденные магазины (pm disable-user) — "
+                             "поведение по умолчанию, ключ оставлен для явности")
+    stores.add_argument("--keep-stores", action="store_true",
+                        help="ничего не выключать: только показать таблицу магазинов")
+    stores.add_argument("--enable-stores", action="store_true",
+                        help="включить магазины обратно (отмена --disable-stores)")
+    stores.add_argument("--remove-stores", action="store_true",
+                        help="снести магазины совсем (как --block-stores, но отдельным "
+                             "этапом и с таблицей)")
+    stores.add_argument("--keep-play", action="store_true",
+                        help="не выключать Google Play (по умолчанию выключается "
+                             "наравне с остальными магазинами: pm disable-user "
+                             "обратим ключом --enable-stores)")
+    stores.add_argument("--include-play", action="store_true",
+                        help="разрешить СНОСИТЬ Google Play (--remove-stores); "
+                             "снос необратим и ломает обновления GMS/WebView, "
+                             "поэтому по умолчанию запрещён")
+    stores.add_argument("--stores-catalog-only", action="store_true",
+                        help="не искать магазины по market://, брать только те, "
+                             "что есть в справочнике APP_STORES (быстрее)")
+    system = parser.add_argument_group(
+        "язык и время",
+        "этап system: русский интерфейс и автоматическое время. Выполняется до "
+        "блокировки настроек — она запрещает менять и то, и другое.")
+    system.add_argument("--locale", default=SYSTEM_LOCALE, metavar="КОД",
+                        help=f"язык системы (по умолчанию {SYSTEM_LOCALE})")
+    system.add_argument("--no-locale", dest="set_locale", action="store_false",
+                        help="не трогать язык системы")
+    system.add_argument("--no-auto-time", dest="auto_time", action="store_false",
+                        help="не включать автоматические дату, время и часовой пояс")
+
     parser.add_argument("--apk", default="", metavar="ПУТЬ",
                         help="APK MDM-агента (по умолчанию hmdm.apk рядом со скриптом)")
     parser.add_argument("--no-install-mdm", dest="install_mdm", action="store_false",
@@ -2573,6 +3371,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     args.auto_student_skip = False
+
+    # --list-stores — короткая запись «только посмотреть магазины»
+    if args.list_stores:
+        args.only = "stores"
+        args.list_only = True
+    if args.enable_stores and args.disable_stores:
+        print("--enable-stores и --disable-stores вместе не имеют смысла", file=sys.stderr)
+        return 2
 
     log_path = None
     if not args.no_log:
