@@ -35,7 +35,7 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import launcher_cleanup as core
 
-TUI_VERSION = "1.9"
+TUI_VERSION = "2.0"
 
 STAGES = [
     ("launchers", "Лаунчеры — снести заводские, оставить MDM"),
@@ -192,8 +192,16 @@ _SILENT = _Silent()
 
 
 def wizard(screen, options: Options) -> bool:
-    """Экран вопросов. True — запускать, False — выход."""
-    cursor = 0
+    """Экран вопросов. True — запускать, False — выход.
+
+    Пунктов больше, чем строк в терминале, поэтому список прокручивается:
+    на экране живёт окно из подходящего числа строк, а `top` — его первая
+    строка. Курсор всегда внутри окна, заголовок раздела едет вместе с
+    первым пунктом раздела, чтобы было видно, что именно настраиваешь.
+    """
+    rows = build_wizard_rows(options)
+    cursor = next((i for i, row in enumerate(rows) if row[3] != "header"), 0)
+    top = 0
     while True:
         rows = build_wizard_rows(options)
         screen.erase()
@@ -209,8 +217,26 @@ def wizard(screen, options: Options) -> bool:
                     curses.color_pair(CLR_OK if options.adb_path else CLR_ERR))
         safe_addstr(screen, 3, 2, "НАСТРОЙКА ПРОГОНА", curses.color_pair(CLR_TITLE) | curses.A_BOLD)
 
-        line = 5
-        for index, (label, value, hint, kind) in enumerate(rows):
+        view_top = 5
+        view_height = max(3, height - view_top - 3)
+
+        # курсор держим в окне; если прямо над ним заголовок — тянем и его
+        anchor = cursor - 1 if cursor > 0 and rows[cursor - 1][3] == "header" else cursor
+        if anchor < top:
+            top = anchor
+        if cursor >= top + view_height:
+            top = cursor - view_height + 1
+        top = max(0, min(top, max(0, len(rows) - view_height)))
+
+        for offset in range(view_height):
+            index = top + offset
+            if index >= len(rows):
+                break
+            label, value, hint, kind = rows[index]
+            line = view_top + offset
+            # строка очищается явно: при прокрутке короткий заголовок раздела
+            # встаёт на место длинного пункта и иначе оставляет от него хвост
+            safe_addstr(screen, line, 0, " " * max(0, width - 1))
             selected = index == cursor
             attr = curses.color_pair(CLR_SEL) if selected else 0
             prefix = "  ▸ " if selected else "    "
@@ -218,13 +244,33 @@ def wizard(screen, options: Options) -> bool:
                 safe_addstr(screen, line, 2, label,
                             curses.color_pair(CLR_TITLE) | curses.A_BOLD)
             else:
-                safe_addstr(screen, line, 2, f"{prefix}{label:<46}", attr)
+                safe_addstr(screen, line, 2, f"{prefix}{label[:46]:<46}", attr)
                 value_attr = curses.color_pair(CLR_OK if value.startswith(("вкл", "да", "[x]"))
                                                else CLR_DIM)
-                safe_addstr(screen, line, 52, value, value_attr | curses.A_BOLD)
-                if hint and selected:
-                    safe_addstr(screen, line, 70, hint, curses.color_pair(CLR_DIM))
-            line += 1
+                safe_addstr(screen, line, 52, value[:21], value_attr | curses.A_BOLD)
+                # подсказка — только если для неё есть место: на узком терминале
+                # она налезала на колонку значения и на полосу прокрутки
+                if hint and selected and width >= 88:
+                    safe_addstr(screen, line, 74, hint[:max(0, width - 78)],
+                                curses.color_pair(CLR_DIM))
+
+        # полоса прокрутки: видно, что список длиннее экрана и где мы в нём
+        if len(rows) > view_height:
+            bar_x = max(0, width - 2)
+            for offset in range(view_height):
+                index = top + offset
+                mark = "│"
+                if offset == 0 and top > 0:
+                    mark = "▲"
+                elif offset == view_height - 1 and top + view_height < len(rows):
+                    mark = "▼"
+                elif index == cursor:
+                    mark = "█"
+                safe_addstr(screen, view_top + offset, bar_x, mark,
+                            curses.color_pair(CLR_SEL if index == cursor else CLR_DIM))
+            position = (f"пункт {cursor + 1} из {len(rows)}"
+                        f"   PgUp/PgDn — страница, Home/End — края")
+            safe_addstr(screen, height - 3, 2, position, curses.color_pair(CLR_DIM))
 
         footer = ("↑↓ — выбор   ←→/Пробел — изменить   Enter — запуск   q — выход")
         safe_addstr(screen, height - 2, 2, footer, curses.color_pair(CLR_DIM))
@@ -240,6 +286,15 @@ def wizard(screen, options: Options) -> bool:
             cursor = selectable[(position + 1) % len(selectable)]
         elif key in (ord(" "), curses.KEY_RIGHT, curses.KEY_LEFT, ord("\t")):
             toggle_row(options, rows[cursor][3], forward=key != curses.KEY_LEFT)
+        elif key in (curses.KEY_NPAGE, curses.KEY_PPAGE):
+            step = max(1, view_height - 1)
+            position = selectable.index(cursor) if cursor in selectable else 0
+            shift = step if key == curses.KEY_NPAGE else -step
+            cursor = selectable[max(0, min(len(selectable) - 1, position + shift))]
+        elif key == curses.KEY_HOME:
+            cursor, top = selectable[0], 0
+        elif key == curses.KEY_END:
+            cursor = selectable[-1]
         elif key in (curses.KEY_ENTER, 10, 13):
             if not options.selected_stages():
                 continue
@@ -320,7 +375,7 @@ def build_wizard_rows(options: Options) -> list[tuple[str, str, str, str]]:
                  f"если сейчас другой — переключить на {options.locale}", "locale"))
     rows.append(("Включать автоматические дату и время", "да" if options.auto_time else "нет",
                  "auto_time и auto_time_zone — синхронизация по сети", "autotime"))
-    rows.append(("Заблокировать настройки (кроме Wi-Fi/Bluetooth)",
+    rows.append(("Заблокировать настройки (Wi-Fi и BT доступны)",
                  "да" if options.lock_settings else "нет",
                  "VPN, сертификаты, сброс, установка приложений", "locksettings"))
     rows.append(("Перезапускать MDM в конце", "да" if options.restart_mdm else "нет",
@@ -496,6 +551,7 @@ class Runner:
         self.stop = False
         self.last_summary: core.Summary | None = None
         self.result: core.Summary | None = None
+        self.card_scroll = 0        # первая видимая строка паспорта
         self.view = "log"
         self.question: str | None = None
         self.answer: bool | None = None
@@ -575,6 +631,7 @@ class Runner:
                 break
 
             self.view = "log"
+            self.card_scroll = 0
             self.state = f"работа: {serial}"
             self.push("banner", f"═══ планшет {serial} ═══")
 
@@ -595,6 +652,7 @@ class Runner:
                 self.show_result(summary)
                 self.result = summary
                 self.view = "card"
+                self.card_scroll = 0
 
             if self.options.count and self.processed >= self.options.count:
                 self.state = "готово"
@@ -738,40 +796,48 @@ class Runner:
                     + summary.assistants_disabled + summary.desktop_disabled
                     + summary.extras_disabled + summary.thirdparty_disabled)
 
-        row = [3]
+        # Карточка сначала собирается в список отрисовщиков, а потом кладётся
+        # на экран окном: паспорт длиннее 24 строк, и без этого его низ
+        # (магазины, язык, время, плашки) молча обрезался.
+        paint: list = []
 
         def line(text: str = "", attr: int = 0) -> None:
-            safe_addstr(screen, row[0], left, "│", curses.color_pair(CLR_TITLE))
-            safe_addstr(screen, row[0], left + 2, text, attr)
-            safe_addstr(screen, row[0], left + box_width - 1, "│",
-                        curses.color_pair(CLR_TITLE))
-            row[0] += 1
+            def draw(y: int) -> None:
+                safe_addstr(screen, y, left, "│", curses.color_pair(CLR_TITLE))
+                safe_addstr(screen, y, left + 2, text, attr)
+                safe_addstr(screen, y, left + box_width - 1, "│",
+                            curses.color_pair(CLR_TITLE))
+            paint.append(draw)
 
         def field(label: str, value: str, pair: int = 0, bold: bool = True) -> None:
-            safe_addstr(screen, row[0], left, "│", curses.color_pair(CLR_TITLE))
-            safe_addstr(screen, row[0], left + 2, label, curses.color_pair(CLR_DIM))
-            attr = curses.color_pair(pair) if pair else 0
-            if bold:
-                attr |= curses.A_BOLD
-            safe_addstr(screen, row[0], left + 24, value or "—", attr)
-            safe_addstr(screen, row[0], left + box_width - 1, "│",
-                        curses.color_pair(CLR_TITLE))
-            row[0] += 1
+            def draw(y: int) -> None:
+                safe_addstr(screen, y, left, "│", curses.color_pair(CLR_TITLE))
+                safe_addstr(screen, y, left + 2, label, curses.color_pair(CLR_DIM))
+                attr = curses.color_pair(pair) if pair else 0
+                if bold:
+                    attr |= curses.A_BOLD
+                safe_addstr(screen, y, left + 24, value or "—", attr)
+                safe_addstr(screen, y, left + box_width - 1, "│",
+                            curses.color_pair(CLR_TITLE))
+            paint.append(draw)
 
         def rule(left_char: str = "├", right_char: str = "┤") -> None:
-            safe_addstr(screen, row[0], left,
-                        left_char + "─" * (box_width - 2) + right_char,
-                        curses.color_pair(CLR_TITLE))
-            row[0] += 1
+            def draw(y: int) -> None:
+                safe_addstr(screen, y, left,
+                            left_char + "─" * (box_width - 2) + right_char,
+                            curses.color_pair(CLR_TITLE))
+            paint.append(draw)
 
         def plate(text: str) -> None:
             padded = text.center(box_width - 4)
-            safe_addstr(screen, row[0], left, "│", curses.color_pair(CLR_TITLE))
-            safe_addstr(screen, row[0], left + 2, padded,
-                        curses.color_pair(CLR_PLATE) | curses.A_BOLD)
-            safe_addstr(screen, row[0], left + box_width - 1, "│",
-                        curses.color_pair(CLR_TITLE))
-            row[0] += 1
+
+            def draw(y: int) -> None:
+                safe_addstr(screen, y, left, "│", curses.color_pair(CLR_TITLE))
+                safe_addstr(screen, y, left + 2, padded,
+                            curses.color_pair(CLR_PLATE) | curses.A_BOLD)
+                safe_addstr(screen, y, left + box_width - 1, "│",
+                            curses.color_pair(CLR_TITLE))
+            paint.append(draw)
 
         # шапка экрана
         head = (f"  ПЛАНШЕТ ГОТОВ · обработано {self.processed}"
@@ -847,11 +913,33 @@ class Runner:
             line()
         rule("└", "┘")
 
+        # ── окно просмотра ──
+        view_top = 2
+        view_height = max(3, height - view_top - 3)
+        top = max(0, min(self.card_scroll, max(0, len(paint) - view_height)))
+        self.card_scroll = top
+        for offset in range(view_height):
+            index = top + offset
+            if index >= len(paint):
+                break
+            paint[index](view_top + offset)
+
+        tail = view_top + min(view_height, len(paint) - top)
         hint = "ОТКЛЮЧИТЕ ПЛАНШЕТ И ПОДКЛЮЧИТЕ СЛЕДУЮЩИЙ"
-        safe_addstr(screen, min(row[0] + 1, height - 3),
-                    max(0, (width - len(hint)) // 2), hint,
-                    curses.color_pair(CLR_WARN) | curses.A_BOLD)
-        safe_addstr(screen, height - 2, 2, "l — показать лог   q — выход",
+        if len(paint) > view_height:
+            # на низком экране подсказку конвейера не прячем — оператор ведёт
+            # работу по ней, — а дописываем к ней положение в паспорте
+            more = len(paint) - top - view_height
+            note = (f"{hint}   ▸ строки {top + 1}–{top + view_height} из {len(paint)}"
+                    + (f", ниже ещё {more}" if more > 0 else ""))
+            safe_addstr(screen, height - 3, max(0, (width - len(note)) // 2), note,
+                        curses.color_pair(CLR_WARN) | curses.A_BOLD)
+        else:
+            safe_addstr(screen, min(tail + 1, height - 3),
+                        max(0, (width - len(hint)) // 2), hint,
+                        curses.color_pair(CLR_WARN) | curses.A_BOLD)
+        safe_addstr(screen, height - 2, 2,
+                    "l — показать лог   ↑↓/PgUp/PgDn — прокрутка   q — выход",
                     curses.color_pair(CLR_DIM))
         screen.refresh()
 
@@ -875,6 +963,18 @@ class Runner:
             return True
         if key in (ord("l"), ord("L"), ord("д")) and self.result is not None:
             self.view = "log" if self.view == "card" else "card"
+            self.card_scroll = 0
+        if self.view == "card" and self.result is not None:
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.card_scroll += 1
+            elif key in (curses.KEY_UP, ord("k")):
+                self.card_scroll = max(0, self.card_scroll - 1)
+            elif key == curses.KEY_NPAGE:
+                self.card_scroll += 10
+            elif key == curses.KEY_PPAGE:
+                self.card_scroll = max(0, self.card_scroll - 10)
+            elif key == curses.KEY_HOME:
+                self.card_scroll = 0
         return False
 
     def wait_key(self) -> None:
