@@ -113,6 +113,7 @@ class Options:
         self.keep_play = False         # не выключать Google Play
         self.stores_catalog_only = False
         self.keep_stores = False       # только показать магазины, не выключать
+        self.reinstall_mdm = "auto"    # auto | force | never — обновление MDM
         self.set_locale = True         # переводить систему на русский
         self.locale = core.SYSTEM_LOCALE
         self.auto_time = True          # автоматические дата, время, часовой пояс
@@ -160,6 +161,7 @@ class Options:
             no_set_home=False, no_set_owner=False, restart_mdm=self.restart_mdm,
             ignore_missing_mdm=False, log_path=log_path,
             apk=self.apk, install_mdm=self.install_mdm, mdm_perms=self.mdm_perms,
+            reinstall_mdm=self.reinstall_mdm,
             remove_extra_users=self.remove_extra_users,
             allowed_file=self.allowed_file,
             fix_mac=self.fix_mac,
@@ -371,6 +373,10 @@ def build_wizard_rows(options: Options) -> list[tuple[str, str, str, str]]:
                  "com.zui.freeform.sidebar", "freeform"))
     rows.append(("Запретить гостя и смену аккаунтов", "да" if options.lock_accounts else "нет",
                  "", "lock"))
+    rows.append(("Обновлять MDM, если он уже стоит",
+                 {"auto": "если APK другой", "force": "всегда",
+                  "never": "нет"}[options.reinstall_mdm],
+                 "обновление идёт поверх: device owner сохраняется", "reinstall"))
     rows.append(("Ставить русский язык системы", "да" if options.set_locale else "нет",
                  f"если сейчас другой — переключить на {options.locale}", "locale"))
     rows.append(("Включать автоматические дату и время", "да" if options.auto_time else "нет",
@@ -405,6 +411,10 @@ def toggle_row(options: Options, kind: str, forward: bool = True) -> None:
         options.keep_stores = not options.keep_stores
         if options.keep_stores:
             options.enable_stores = False
+    elif kind == "reinstall":
+        order = ["auto", "force", "never"]
+        step = 1 if forward else -1
+        options.reinstall_mdm = order[(order.index(options.reinstall_mdm) + step) % 3]
     elif kind == "locale":
         options.set_locale = not options.set_locale
     elif kind == "autotime":

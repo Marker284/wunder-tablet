@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import hashlib
 import os
 import re
 import shutil
@@ -534,7 +535,10 @@ class Log:
         self._write("WARN", _strip_ansi(text))
 
     def err(self, text: str) -> None:
-        print(f"{C.p(C.RED, '  ✖')} {text}", file=sys.stderr)
+        # stdout в файл/канал буферизуется блоками, stderr — нет, и без этого
+        # сброса красные строки в сохранённом выводе уезжают со своего места
+        sys.stdout.flush()
+        print(f"{C.p(C.RED, '  ✖')} {text}", file=sys.stderr, flush=True)
         self._write("ERROR", _strip_ansi(text))
 
     def step(self, text: str) -> None:
@@ -590,6 +594,8 @@ class Adb:
     serial: str | None = None
     log: Log | None = None
     verbose: bool = False
+    _props_cache: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    last_install_error: str = field(default="", init=False, repr=False)
 
     def _base(self) -> list[str]:
         cmd = [self.binary]
@@ -616,8 +622,22 @@ class Adb:
         proc = self.run("shell", command, timeout=timeout)
         return (proc.stdout or "") + (proc.stderr or "")
 
-    def prop(self, name: str) -> str:
-        return self.shell(f"getprop {name}").strip()
+    def load_all_props(self) -> dict[str, str]:
+        """Загружает все системные свойства планшета за один вызов getprop."""
+        raw = self.shell("getprop")
+        self._props_cache = dict(re.findall(r"\[([^\]]+)\]:\s*\[([^\]]*)\]", raw))
+        return self._props_cache
+
+    def prop(self, name: str, fresh: bool = False) -> str:
+        if not fresh and name in self._props_cache:
+            return self._props_cache[name]
+        if not fresh and not self._props_cache:
+            self.load_all_props()
+            if name in self._props_cache:
+                return self._props_cache[name]
+        val = self.shell(f"getprop {name}").strip()
+        self._props_cache[name] = val
+        return val
 
     def describe(self) -> str:
         brand = self.prop("ro.product.brand") or "?"
@@ -1026,8 +1046,121 @@ def find_mdm_apk(args: argparse.Namespace, log: Log) -> str | None:
     return None
 
 
-def install_mdm(adb: Adb, log: Log, args: argparse.Namespace, apk: str) -> bool:
-    """Ставит MDM-агент. Возвращает True, если пакет оказался на устройстве."""
+def installed_mdm_version(adb: Adb) -> str:
+    """Версия MDM-агента на планшете: «5.28 (528)» или пустая строка."""
+    dump = adb.shell(f"dumpsys package {MDM_PACKAGE}")
+    name = re.search(r"versionName=(\S+)", dump)
+    code = re.search(r"versionCode=(\d+)", dump)
+    if not name and not code:
+        return ""
+    return (name.group(1) if name else "?") + (f" ({code.group(1)})" if code else "")
+
+
+def device_apk_digest(adb: Adb, log: Log, package: str) -> str:
+    """SHA-256 установленного APK, посчитанный на самом планшете.
+
+    Сравнение хэшей — единственный точный способ понять, стоит ли на планшете
+    ровно тот файл, что лежит у нас: versionCode сборщик может не поднять, а
+    выкачивать 8 МБ с каждого планшета ради сравнения незачем.
+    """
+    path = ""
+    for line in adb.shell(f"pm path {package}").splitlines():
+        line = line.strip()
+        if line.startswith("package:"):
+            path = line.split(":", 1)[1].strip()
+            break                      # base.apk идёт первым
+    if not path:
+        return ""
+    for tool in ("sha256sum", "toybox sha256sum", "md5sum"):
+        out = adb.shell(f"{tool} {path}").strip()
+        match = re.match(r"([0-9a-f]{32,64})\s", out + " ")
+        if match:
+            return f"{tool.split()[-1]}:{match.group(1)}"
+    log.info("на планшете нет sha256sum/md5sum — сверить сборки по файлу не выйдет")
+    return ""
+
+
+def local_apk_digest(apk: str, algorithm: str) -> str:
+    """Тот же хэш, но для файла у нас на диске — читаем по кусочкам."""
+    digest = hashlib.new("sha256" if algorithm == "sha256sum" else "md5")
+    with open(apk, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def apk_is_same_build(adb: Adb, log: Log, apk: str) -> bool | None:
+    """True — на планшете ровно этот файл, False — другой, None — не проверить."""
+    stamp = device_apk_digest(adb, log, MDM_PACKAGE)
+    if not stamp:
+        return None
+    algorithm, _, device_hash = stamp.partition(":")
+    return device_hash == local_apk_digest(apk, algorithm)
+
+
+def reinstall_mdm(adb: Adb, log: Log, args: argparse.Namespace, apk: str) -> bool:
+    """Обновляет MDM поверх установленного, не теряя device owner и настройки.
+
+    adb install -r ставит поверх: пакет, его данные и статус владельца
+    устройства сохраняются. Сносить и ставить заново НЕЛЬЗЯ — вместе с
+    пакетом уедет device owner, а вернуть его без сброса планшета не выйдет.
+    """
+    log.step("Обновление MDM-агента")
+    before = installed_mdm_version(adb)
+    log.info(f"на планшете: {before or 'версия не определилась'}")
+
+    if not install_mdm(adb, log, args, apk, was_present=True):
+        log.err("обновить не удалось — на планшете осталась прежняя сборка "
+                f"{before or '(версия не определилась)'}")
+        if "UPDATE_INCOMPATIBLE" in adb.last_install_error:
+            log.err("НЕ сносите пакет вручную: вместе с ним уедет device owner "
+                    "и вернуть его можно будет только сбросом планшета")
+            log.info("нужна сборка, подписанная тем же ключом, что и стоящая")
+        return False
+
+    if args.dry_run:
+        log.info("dry-run: планшет не трогали")
+        return True
+
+    # Проверяем не по словам adb, а по файлу на планшете: Headwind собирает
+    # агент под конкретный сервер, поэтому versionCode у разных сборок
+    # совпадает, и сверять версии бесполезно.
+    after = installed_mdm_version(adb)
+    if apk_is_same_build(adb, log, apk) is False:
+        log.err("adb отчитался об успехе, но на планшете остался прежний файл")
+        log.info("проверьте экран планшета: установка могла ждать подтверждения")
+        return False
+    if before and after and before != after:
+        log.ok(f"MDM обновлён: {before} → {after}")
+    else:
+        log.ok(f"MDM обновлён из {os.path.basename(apk)}"
+               + (f" · версия прежняя: {after}" if after else "")
+               + " (сверено по файлу на планшете)")
+    return True
+
+
+def _retry_makes_sense(output: str) -> bool:
+    """Есть ли смысл пробовать следующую стратегию установки.
+
+    Разный sharedUserId и разная подпись не лечатся ключами adb — на них
+    перебор стратегий только тратит время оператора.
+    """
+    if "UID_CHANGED" in output or "shared user changed" in output:
+        return False
+    if "UPDATE_INCOMPATIBLE" in output or "signatures do not match" in output:
+        return False
+    return "DEPRECATED_SDK_VERSION" in output or "VERSION_DOWNGRADE" in output
+
+
+def install_mdm(adb: Adb, log: Log, args: argparse.Namespace, apk: str,
+                was_present: bool = False) -> bool:
+    """Ставит MDM-агент. Возвращает True, если установка прошла.
+
+    was_present=True — пакет на планшете уже был (обновление). Тогда «пакет
+    есть в pm list» ничего не доказывает: он был там и до нас. В этом режиме
+    успехом считается только Success от самого adb, а фактическую замену
+    файла проверяет вызывающий по хэшу.
+    """
     size_mb = os.path.getsize(apk) / (1024 * 1024)
     log.info(f"APK: {apk} ({size_mb:.1f} МБ)")
 
@@ -1052,6 +1185,19 @@ def install_mdm(adb: Adb, log: Log, args: argparse.Namespace, apk: str) -> bool:
         log.cmd("adb " + " ".join(arguments))
         proc = adb.run(*arguments, timeout=600)
         last = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        adb.last_install_error = last
+
+        if was_present:
+            # Обновление: судим строго по ответу adb — наличие пакета тут
+            # ничего не значит, он был на месте и до попытки
+            if proc.returncode == 0 and "Success" in last:
+                log.ok("adb отчитался об успешной установке")
+                adb.last_install_error = ""
+                return True
+            log.warn(f"установка не прошла: {short_error(last) or 'нет вывода'}")
+            if _retry_makes_sense(last):
+                continue
+            break
 
         # Пакет появляется в pm list не мгновенно: PackageManager ещё
         # дописывает сессию. Ждём до 15 секунд, а не спрашиваем один раз.
@@ -1061,6 +1207,7 @@ def install_mdm(adb: Adb, log: Log, args: argparse.Namespace, apk: str) -> bool:
             if MDM_PACKAGE in installed_packages(adb):
                 log.ok(f"{MDM_PACKAGE} установлен"
                        + (f" (пакет появился через ~{delay} с)" if delay else ""))
+                adb.last_install_error = ""
                 return True
             if "Success" not in last:
                 break                      # ждать нечего — установка не отчиталась успехом
@@ -1071,7 +1218,7 @@ def install_mdm(adb: Adb, log: Log, args: argparse.Namespace, apk: str) -> bool:
         else:
             log.warn(f"установка не прошла (код {proc.returncode}): {short_error(last)}")
 
-        if "DEPRECATED_SDK_VERSION" in last or "VERSION_DOWNGRADE" in last:
+        if _retry_makes_sense(last):
             continue                       # следующая стратегия имеет смысл
         if not [serial for serial, state in list_devices(adb.binary)
                 if serial == adb.serial and state == "device"]:
@@ -1080,12 +1227,26 @@ def install_mdm(adb: Adb, log: Log, args: argparse.Namespace, apk: str) -> bool:
         break
 
     log.err(f"не удалось установить MDM: {short_error(last) or 'нет вывода'}")
-    if "Performing Streamed Install" in last and "Success" not in last:
+    known_cause = ("INSTALL_FAILED_UID_CHANGED" in last
+                   or "shared user changed" in last
+                   or "INSTALL_FAILED_UPDATE_INCOMPATIBLE" in last
+                   or "INSTALL_FAILED_USER_RESTRICTED" in last)
+    if not known_cause and "Performing Streamed Install" in last and "Success" not in last:
         log.info("установка оборвалась на полпути — обычно это подтверждение на "
                  "экране планшета или обрыв USB")
         log.info("Xiaomi/POCO: Настройки → Для разработчиков → включите "
                  "«Установка через USB» (требует входа в Mi-аккаунт и SIM-карты)")
         log.info("проверьте кабель и порт: дешёвые удлинители рвут длинные передачи")
+    if "INSTALL_FAILED_UID_CHANGED" in last or "shared user changed" in last:
+        log.err("НОВЫЙ APK НЕСОВМЕСТИМ С УСТАНОВЛЕННЫМ: у сборок разный "
+                "sharedUserId, Android не даёт менять его при обновлении")
+        log.info("поверх такая сборка не встанет ни одним ключом — вопрос не "
+                 "в adb, а в том, как собран APK")
+        log.info("сносить пакет ради установки НЕЛЬЗЯ: вместе с ним уедет "
+                 "device owner, а вернуть его можно только сбросом планшета")
+        log.info("что делать: взять в консоли Headwind MDM сборку агента "
+                 "с тем же sharedUserId, что у установленной, — либо обновлять "
+                 "агент через саму консоль MDM, а не через adb")
     if "INSTALL_FAILED_USER_RESTRICTED" in last:
         log.info("на планшете запрещена установка из неизвестных источников — "
                  "разрешите отладку по USB и установку приложений")
@@ -1123,10 +1284,57 @@ def grant_mdm_permissions(adb: Adb, log: Log, dry_run: bool) -> int:
     return granted
 
 
+def update_mdm_if_needed(adb: Adb, log: Log, args: argparse.Namespace) -> bool:
+    """Обновляет уже стоящий MDM, если рядом лежит другая сборка APK.
+
+    Режимы ключа --reinstall-mdm:
+      auto  — сверить APK с тем, что на планшете, и обновить при различии;
+      force — поставить поверх всегда, не сверяя;
+      never — не трогать (сюда мы не попадаем, отсечено выше).
+    """
+    apk = find_mdm_apk(args, log)
+    if not apk:
+        log.info("APK рядом со скриптом нет — обновлять нечем, работаю с тем, "
+                 "что стоит")
+        return False
+
+    if args.reinstall_mdm == "force":
+        log.warn(f"ключ --reinstall-mdm: ставлю {os.path.basename(apk)} поверх "
+                 f"без сверки")
+        return reinstall_mdm(adb, log, args, apk)
+
+    same = apk_is_same_build(adb, log, apk)
+    if same is True:
+        log.ok(f"на планшете ровно эта сборка ({os.path.basename(apk)}) — "
+               f"обновлять нечего")
+        return False
+    if same is None:
+        log.warn("сверить сборки по файлу не вышло — обновляю на всякий случай")
+    else:
+        log.warn(f"на планшете ДРУГАЯ сборка MDM — обновляю из "
+                 f"{os.path.basename(apk)}")
+    return reinstall_mdm(adb, log, args, apk)
+
+
+def _after_mdm_update(adb: Adb, log: Log, args: argparse.Namespace, ok: bool) -> bool:
+    """В новой сборке список разрешений мог вырасти — выдаём их заново."""
+    if ok and args.mdm_perms and not args.dry_run:
+        grant_mdm_permissions(adb, log, args.dry_run)
+    return ok
+
+
 def ensure_mdm_installed(adb: Adb, log: Log, args: argparse.Namespace) -> bool:
-    """Ставит MDM, если его нет. Вызывается ДО любого сноса лаунчеров."""
+    """Ставит MDM, если его нет, и обновляет, если рядом лежит другая сборка.
+
+    Вызывается ДО любого сноса лаунчеров: если обновление не встанет, снимать
+    заводской лаунчер нельзя — планшет останется без домашнего экрана.
+    """
     if MDM_PACKAGE in installed_packages(adb):
-        log.ok(f"{MDM_PACKAGE} установлен")
+        version = installed_mdm_version(adb)
+        log.ok(f"{MDM_PACKAGE} установлен" + (f" · {version}" if version else ""))
+        if args.install_mdm and args.reinstall_mdm != "never":
+            _after_mdm_update(adb, log, args,
+                              update_mdm_if_needed(adb, log, args))
         return True
 
     log.warn(f"{MDM_PACKAGE} на устройстве нет")
@@ -1239,14 +1447,28 @@ INVENTORY_COLUMNS = [
     "патч безопасности", "ОЗУ", "накопитель", "свободно", "экран", "плотность",
     "платформа", "Wi-Fi MAC", "Wi-Fi MAC заводской", "рандомизация MAC",
     "Bluetooth MAC", "Android ID", "батарея", "Google-аккаунт", "владелец",
-    "домашний экран", "браузер", "язык", "время", "магазины",
+    "домашний экран", "браузер", "версия MDM", "язык", "время", "магазины",
     "удалено", "отключено", "не удалось",
     "ФИО ученика", "класс", "примечание",
 ]
 
 
+def parse_batch_sections(output: str) -> dict[str, str]:
+    """Разбивает вывод составной шелл-команды на секции по маркерам ===TAG===."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in output.splitlines():
+        line_s = line.strip()
+        if line_s.startswith("===") and line_s.endswith("==="):
+            current = line_s.strip("=")
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return {k: "\n".join(v).strip() for k, v in sections.items()}
+
+
 def collect_specs(adb: Adb, log: Log) -> dict[str, str]:
-    """Характеристики планшета для таблицы учёта."""
+    """Характеристики планшета для таблицы учёта (пакетный опрос в 1-2 вызова)."""
     log.step("Сбор характеристик планшета")
 
     def mb(value: str) -> str:
@@ -1254,6 +1476,9 @@ def collect_specs(adb: Adb, log: Log) -> dict[str, str]:
             return f"{int(value) / 1024:.0f} МБ"
         except (TypeError, ValueError):
             return ""
+
+    # 1. Пакетная загрузка всех getprop за один раз
+    adb.load_all_props()
 
     specs: dict[str, str] = {}
     specs["бренд"] = adb.prop("ro.product.brand")
@@ -1265,27 +1490,44 @@ def collect_specs(adb: Adb, log: Log) -> dict[str, str]:
     specs["платформа"] = adb.prop("ro.board.platform") or adb.prop("ro.hardware")
     specs["серийный"] = adb.prop("ro.serialno") or (adb.serial or "")
 
-    mem = adb.shell("cat /proc/meminfo")
+    # 2. Пакетная выгрузка метрик ОС за один вызов adb shell
+    batch_cmd = (
+        "echo '===MEM==='; cat /proc/meminfo 2>/dev/null | grep MemTotal; "
+        "echo '===DISK==='; df -h /data 2>/dev/null; "
+        "echo '===SIZE==='; wm size 2>/dev/null; "
+        "echo '===DENSITY==='; wm density 2>/dev/null; "
+        "echo '===AID==='; settings get secure android_id 2>/dev/null; "
+        "echo '===BATT==='; dumpsys battery 2>/dev/null; "
+        "echo '===WLAN0==='; cat /sys/class/net/wlan0/address 2>/dev/null; "
+        "echo '===WLAN1==='; cat /sys/class/net/wlan1/address 2>/dev/null; "
+        "echo '===ETH0==='; cat /sys/class/net/eth0/address 2>/dev/null; "
+        "echo '===WIFI==='; dumpsys wifi 2>/dev/null | grep -m4 -E 'mWifiInfo|useRandomizedMac'; "
+        "echo '===BT==='; settings get secure bluetooth_address 2>/dev/null"
+    )
+    batch_raw = adb.shell(batch_cmd)
+    batch = parse_batch_sections(batch_raw)
+
+    mem = batch.get("MEM") or adb.shell("cat /proc/meminfo")
     match = re.search(r"MemTotal:\s+(\d+)", mem)
     specs["ОЗУ"] = mb(match.group(1)) if match else ""
 
-    disk = adb.shell("df -h /data")
+    disk = batch.get("DISK") or adb.shell("df -h /data")
     parts = disk.strip().splitlines()[-1].split() if disk.strip() else []
     if len(parts) >= 4:
         specs["накопитель"] = parts[1]
         specs["свободно"] = parts[3]
 
-    size = adb.shell("wm size")
+    size = batch.get("SIZE") or adb.shell("wm size")
     match = re.search(r"Physical size:\s*(\S+)", size)
     specs["экран"] = match.group(1) if match else ""
-    density = adb.shell("wm density")
+    density = batch.get("DENSITY") or adb.shell("wm density")
     match = re.search(r"Physical density:\s*(\S+)", density)
     specs["плотность"] = match.group(1) if match else ""
 
-    specs.update(collect_mac(adb))
-    specs["Android ID"] = adb.shell("settings get secure android_id").strip()
+    specs.update(collect_mac(adb, batch_data=batch))
+    specs["Android ID"] = (batch.get("AID") or adb.shell("settings get secure android_id")).strip()
 
-    battery = adb.shell("dumpsys battery")
+    battery = batch.get("BATT") or adb.shell("dumpsys battery")
     level = re.search(r"level:\s*(\d+)", battery)
     health = re.search(r"health:\s*(\d+)", battery)
     health_map = {"2": "хорошее", "3": "перегрев", "4": "мертвая", "5": "перенапряжение",
@@ -1317,6 +1559,7 @@ def inventory_row(summary: Summary, specs: dict[str, str]) -> dict[str, str]:
     row["владелец"] = summary.owner_label or "не назначен"
     row["домашний экран"] = summary.home_now
     row["браузер"] = summary.browser_now
+    row["версия MDM"] = summary.mdm_version
     row["язык"] = summary.locale_now or summary.locale_before
     row["время"] = summary.time_note if summary.time_auto else (
         f"НЕ АВТО: {summary.time_note}" if summary.time_note else "")
@@ -1425,7 +1668,8 @@ def fill_device_card(adb: Adb, summary: Summary) -> None:
     summary.build = adb.prop("ro.build.display.id") or adb.prop("ro.build.id")
 
     owners = adb.shell("dpm list-owners")
-    match = re.search(r"admin=ComponentInfo\{([^}]+)\}", adb.shell("dumpsys device_policy"))
+    dp_dump = adb.shell("dumpsys device_policy")
+    match = re.search(r"admin=ComponentInfo\{([^}]+)\}", dp_dump)
     if match:
         summary.owner_component = match.group(1)
     elif "/" in owners:
@@ -1435,7 +1679,8 @@ def fill_device_card(adb: Adb, summary: Summary) -> None:
         pkg = summary.owner_component.split("/", 1)[0]
         summary.owner_label = "Headwind MDM" if pkg == MDM_PACKAGE else pkg
 
-    summary.restrictions = sorted(read_user_restrictions(adb))
+    summary.mdm_version = installed_mdm_version(adb)
+    summary.restrictions = sorted(read_user_restrictions(adb, dump=dp_dump))
     if not summary.accounts:
         summary.accounts = collect_accounts(adb)
     if not summary.users:
@@ -1444,9 +1689,9 @@ def fill_device_card(adb: Adb, summary: Summary) -> None:
     summary.browser_now = current_browser(adb) or ""
 
 
-def read_user_restrictions(adb: Adb) -> set[str]:
+def read_user_restrictions(adb: Adb, dump: str | None = None) -> set[str]:
     """Ограничения, выставленные владельцем устройства (device owner)."""
-    out = adb.shell("dumpsys device_policy")
+    out = dump if dump is not None else adb.shell("dumpsys device_policy")
     restrictions: set[str] = set()
     collecting = False
     for line in out.splitlines():
@@ -1496,22 +1741,35 @@ def is_randomized_mac(mac: str) -> bool:
         return False
 
 
-def collect_mac(adb: Adb) -> dict[str, str]:
+def collect_mac(adb: Adb, batch_data: dict[str, str] | None = None) -> dict[str, str]:
     """Текущий и заводской MAC, признак рандомизации, MAC Bluetooth."""
     info = {"Wi-Fi MAC": "", "Wi-Fi MAC заводской": "",
             "рандомизация MAC": "", "Bluetooth MAC": ""}
 
+    def pick(key: str, command: str) -> str:
+        """Значение из пакетного ответа; если секции в нём нет — отдельной командой.
+
+        Секция пропадает, когда составная команда оборвалась на полпути
+        (adb-таймаут, зависший dumpsys). Раньше в этом месте прилетал None
+        и прогон падал на .strip().
+        """
+        if batch_data is not None and key in batch_data:
+            return batch_data[key] or ""
+        return adb.shell(command)
+
     # /sys/class/net/*/address на Android 11+ закрыт для adb shell —
     # рабочий источник это dumpsys wifi, он же показывает useRandomizedMac.
     for interface in ("wlan0", "wlan1", "eth0"):
-        mac = adb.shell(f"cat /sys/class/net/{interface}/address").strip().lower()
+        mac = pick(interface.upper(),
+                   f"cat /sys/class/net/{interface}/address").strip().lower()
         if re.fullmatch(r"[0-9a-f:]{17}", mac):
             info["Wi-Fi MAC"] = mac
             break
 
     wifi_dump = ""
     if not info["Wi-Fi MAC"]:
-        wifi_dump = adb.shell("dumpsys wifi | grep -m4 -E 'mWifiInfo|useRandomizedMac'")
+        wifi_dump = pick("WIFI",
+                         "dumpsys wifi | grep -m4 -E 'mWifiInfo|useRandomizedMac'")
         for candidate in re.findall(r"MAC:\s*([0-9a-fA-F:]{17})", wifi_dump):
             candidate = candidate.lower()
             if candidate != "02:00:00:00:00:00":     # заглушка отключённого интерфейса
@@ -1524,7 +1782,7 @@ def collect_mac(adb: Adb) -> dict[str, str]:
             info["Wi-Fi MAC заводской"] = value
             break
 
-    bluetooth = adb.shell("settings get secure bluetooth_address").strip().lower()
+    bluetooth = pick("BT", "settings get secure bluetooth_address").strip().lower()
     if re.fullmatch(r"[0-9a-f:]{17}", bluetooth):
         info["Bluetooth MAC"] = bluetooth
 
@@ -2048,12 +2306,12 @@ def stores_card_value(item: "Summary") -> str:
 # запрещают менять ровно то, что мы здесь выставляем.
 
 
-def current_locale(adb: Adb) -> str:
+def current_locale(adb: Adb, fresh: bool = False) -> str:
     """Язык, на котором система работает прямо сейчас: ru-RU, en-US и т.п."""
     match = re.search(r"\b([a-z]{2})-r([A-Z]{2})\b", adb.shell("am get-config"))
     if match:
         return f"{match.group(1)}-{match.group(2)}"
-    for source in (adb.prop("persist.sys.locale"),
+    for source in (adb.prop("persist.sys.locale", fresh=fresh),
                    adb.shell("settings get system system_locales")):
         value = (source or "").split(",")[0].strip()
         if value and value != "null":
@@ -2099,11 +2357,13 @@ def set_system_locale(adb: Adb, log: Log, wanted: str,
         if out and ("Exception" in out or "denied" in out.lower()):
             log.warn(f"{command.split(' ')[0]}: {short_error(out)}")
 
-    now = current_locale(adb)
+    now = current_locale(adb, fresh=True)
     if locale_matches(now, wanted):
         return "ok", now or wanted
 
-    stored = (adb.prop("persist.sys.locale") or "").replace("_", "-")
+    # fresh=True обязательно: кэш getprop помнит язык, который был ДО setprop,
+    # и проверка «записалось ли» иначе всегда сравнивала со старым значением
+    stored = (adb.prop("persist.sys.locale", fresh=True) or "").replace("_", "-")
     setting = adb.shell("settings get system system_locales").strip()
     if locale_matches(stored, wanted) or wanted.lower() in setting.lower():
         return "reboot", f"записан {wanted}, сейчас ещё {now or 'не определён'}"
@@ -2391,7 +2651,11 @@ def short_error(out: str) -> str:
         if "Exception" in line and "occurred while executing" not in line:
             head = line
             break
-        if line.startswith("Failure") or "Error" in line:
+        # «adb: failed to install …: Failure [INSTALL_FAILED_UID_CHANGED: …]» —
+        # самая внятная строка установки, а первой идёт бесполезное
+        # «Performing Streamed Install»
+        if ("INSTALL_FAILED" in line or "Failure" in line
+                or "failed to install" in line or "Error" in line):
             head = line
             break
     return head[:200]
@@ -2592,6 +2856,7 @@ class Summary:
     browser_set: bool = False
     owner_set: bool = False
     mdm_installed: bool = False
+    mdm_version: str = ""
     users_removed: list[str] = field(default_factory=list)
     aborted: str = ""
     # паспорт устройства
@@ -3121,7 +3386,9 @@ def print_device_card(log: Log, item: Summary) -> None:
 
     owner = item.owner_component or "не назначен"
     owner_color = C.GREEN if item.owner_component.startswith(MDM_PACKAGE) else C.YELLOW
-    row("MDM-агент", "установлен" if item.mdm_installed else "НЕТ",
+    row("MDM-агент",
+        (f"установлен · {item.mdm_version}" if item.mdm_version
+         else "установлен") if item.mdm_installed else "НЕТ",
         C.GREEN if item.mdm_installed else C.RED)
     row("Владелец (owner)", owner, owner_color)
     row("Кто держит owner", item.owner_label or "никто", owner_color)
@@ -3328,6 +3595,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--apk", default="", metavar="ПУТЬ",
                         help="APK MDM-агента (по умолчанию hmdm.apk рядом со скриптом)")
+    parser.add_argument("--reinstall-mdm", nargs="?", const="force", default="auto",
+                        choices=["auto", "force", "never"],
+                        help="обновлять MDM, когда он уже стоит: auto — сверить "
+                             "APK с планшетом и обновить при различии (по "
+                             "умолчанию), force (или просто --reinstall-mdm) — "
+                             "ставить поверх всегда, never — не трогать. "
+                             "Обновление идёт через adb install -r: device owner "
+                             "и настройки сохраняются")
     parser.add_argument("--no-install-mdm", dest="install_mdm", action="store_false",
                         help="не устанавливать MDM, даже если его нет")
     parser.add_argument("--no-mdm-perms", dest="mdm_perms", action="store_false",

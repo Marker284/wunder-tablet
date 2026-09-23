@@ -633,6 +633,7 @@ class MainWindow(QMainWindow):
         for key, label, default in (
             ("install_mdm", "Ставить MDM-агент, если его нет (hmdm.apk рядом)", True),
             ("mdm_perms", "Выдавать разрешения MDM после установки", True),
+            ("force_reinstall_mdm", "Ставить APK поверх всегда, даже если сборка та же", False),
             ("mute_notifications", "Глушить уведомления неразрешённых приложений", True),
             ("mute_stores", "Глушить уведомления магазинов (Play, GetApps)", True),
             ("remove_preinstalled", "Сносить заводские приложения вендора", False),
@@ -732,6 +733,8 @@ class MainWindow(QMainWindow):
                                       "allowed_apps.txt"),
             inventory="", ask_student=False, auto_student_skip=True,
             list_stores=False,
+            reinstall_mdm=("force" if self.flag_boxes["force_reinstall_mdm"].isChecked()
+                           else "auto"),
             locale=self.locale_edit.text().strip() or core.SYSTEM_LOCALE,
             student="", student_class="", on_duplicate="update",
             log_path=os.path.join(log_dir, f"gui_{stamp}.log"),
